@@ -14,8 +14,6 @@ import subprocess
 import traceback
 from datetime import datetime, timedelta
 from PIL import Image, ImageFilter
-from datetime import datetime, timedelta
-from PIL import Image
 from faster_whisper import WhisperModel
 
 import pyttsx3
@@ -1077,7 +1075,6 @@ def route_intent(user_text: str):
 
 
 def build_prompt(memory_state, user_text, response_mode: str = ""):
-def build_prompt(memory_state, user_text):
     # Reduce "stuck on old topics" by NOT always dumping summary/facts/recent in full.
     # We include a compact hint and the last few turns only.
     now_local = datetime.now().isoformat(timespec="seconds")
@@ -2603,30 +2600,6 @@ def get_clipboard_text():
     except Exception:
         try:
             import tkinter
-    # --- Reminder command ---
-    rem = parse_reminder_command(user_text)
-    if rem:
-        seconds_from_now, rem_text = rem
-        r = add_reminder(memory_state, seconds_from_now, rem_text)
-        save_memory_state(memory_state)
-        # zeta should confirm quickly (no AI call needed)
-        mins = max(1, int(round(seconds_from_now / 60)))
-        assistant_text = f"Alright. I’ll ping you in {mins} min about: {rem_text}."
-        print("\n[AI]:", assistant_text)
-        speak(assistant_text)
-        print("-" * 50)
-        # still log it
-        append_log({
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "user": user_text,
-            "assistant": assistant_text,
-            "used_screen": False
-        })
-        memory_state["recent"].append({"role":"user","text":user_text})
-        memory_state["recent"].append({"role":"assistant","text":assistant_text})
-        memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
-        save_memory_state(memory_state)
-        return memory_state
 
             root = tkinter.Tk()
             root.withdraw()
@@ -3130,6 +3103,8 @@ def respond_and_store(memory_state, user_text, metrics=None):
             })
             return memory_state
 
+        streamed_tts = False
+
         if use_screen:
             print("[4] Thinking (screen)...")
             speak("Got it — looking at the screen.")
@@ -3138,15 +3113,18 @@ def respond_and_store(memory_state, user_text, metrics=None):
                 metrics["llm_start_ts"] = time.time()
             try:
                 assistant_text = stream_reply_with_tts(VISION_MODEL, prompt, images=images)
+                streamed_tts = True
             except Exception:
                 log_exception("vision stream")
                 try:
                     prompt, images = build_screen_prompt(memory_state, user_text, response_mode=response_mode, include_ocr=False)
                     assistant_text = stream_reply_with_tts(VISION_MODEL, prompt, images=images)
+                    streamed_tts = True
                 except Exception:
                     log_exception("vision retry no ocr")
                     prompt, images = build_screen_prompt(memory_state, user_text, response_mode=response_mode, include_roi=False, include_ocr=False)
                     assistant_text = stream_reply_with_tts(VISION_MODEL, prompt, images=images)
+                    streamed_tts = True
             if metrics is not None:
                 metrics["llm_end_ts"] = time.time()
                 if metrics.get("llm_start_ts"):
@@ -3159,6 +3137,7 @@ def respond_and_store(memory_state, user_text, metrics=None):
                 metrics["llm_start_ts"] = time.time()
             try:
                 assistant_text = stream_reply_with_tts(CHAT_MODEL, prompt)
+                streamed_tts = True
             except Exception:
                 log_exception("chat stream")
                 assistant_text = ollama_generate(FALLBACK_CHAT_MODEL, prompt)
@@ -3172,18 +3151,11 @@ def respond_and_store(memory_state, user_text, metrics=None):
         if due_now:
             reminder_lines = [f"Reminder: {r['text']}." for r in due_now]
             assistant_text = "\n".join(reminder_lines + [assistant_text])
-    due_now = pop_due_reminders(memory_state)
-    if due_now:
-        reminder_lines = [f"Reminder: {r['text']}." for r in due_now]
-        assistant_text = "\n".join(reminder_lines + [assistant_text])
-
-    # Optional: add a tiny “initiative” line sometimes (Neuro-style)
-    assistant_text = maybe_add_initiative(memory_state, assistant_text)
 
         assistant_text = maybe_add_initiative(memory_state, assistant_text)
 
         print("\n[AI]:", assistant_text)
-        if not tts_pending_or_busy():
+        if not streamed_tts and not tts_pending_or_busy():
             speak(assistant_text)
         print("-" * 50)
 
