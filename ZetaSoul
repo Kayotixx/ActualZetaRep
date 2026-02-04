@@ -93,7 +93,7 @@ MIN_RECORD_TIME = 0.6
 CALIBRATION_TIME = 0.4
 
 # Follow-up behavior
-FOLLOWUP_WINDOW_SEC = 10_000_000.00          # after zeta replies, you have 10 seconds to speak again
+FOLLOWUP_WINDOW_SEC = 10.0          # after zeta replies, you have 10 seconds to speak again
 FOLLOWUP_CALIBRATION_SEC = 0.25     # quick ambient calibration
 FOLLOWUP_START_MULTIPLIER = 2     # speech start threshold = noise * multiplier (plus floor)
 FOLLOWUP_START_FLOOR = 0.0025      # minimum threshold
@@ -906,8 +906,8 @@ def screenshots_all_monitors_base64():
     return imgs
 # ----------------- Whisper transcription -----------------
 # ----------------- Whisper transcription -----------------
-ASR_MIN_AVG_LOGPROB = -0.85   # higher = stricter (try -0.75 to be pickier)
-ASR_MAX_NO_SPEECH = 0.65      # lower = stricter (try 0.55 to be pickier)
+ASR_MIN_AVG_LOGPROB = -1.05   # slightly more lenient to reduce missed speech
+ASR_MAX_NO_SPEECH = 0.75      # slightly more lenient to reduce false "no speech"
 ASR_MAX_COMPRESSION_RATIO = 2.6  # catches loop-y hallucinations
 
 def transcribe(audio_1d):
@@ -921,8 +921,8 @@ def transcribe(audio_1d):
         min_silence_duration_ms=250,
         speech_pad_ms=250
     ),
-    beam_size=6,
-    best_of=2,
+    beam_size=4,
+    best_of=1,
     temperature=0.0,
     condition_on_previous_text=False
     )
