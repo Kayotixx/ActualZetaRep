@@ -1,0 +1,2229 @@
+
+import mss
+import base64
+import requests
+import keyboard
+import sounddevice as sd
+import numpy as np
+import time
+import io
+import json
+import os
+from datetime import datetime
+from PIL import Image
+from faster_whisper import WhisperModel
+
+import pyttsx3
+import threading
+import queue
+from collections import deque
+import re
+from typing import Optional, Tuple
+
+from vosk import Model as VoskModel, KaldiRecognizer
+
+
+CHAR_FLOORS = {
+    "energy": 0.30,
+    "confidence": 0.5,
+    "affection": 0.15,
+    "curiosity": 0.40,
+}
+
+
+# --- Normal listening speech confirmation (same idea as barge-in) ---
+COMMAND_USE_VOSK_CONFIRM = True
+COMMAND_CONFIRM_SEC = 0.16
+
+
+
+# ----------------- Vosk for barge-in (speech confirm) -----------------
+barge_vosk_model = None
+
+def get_barge_vosk_model():
+    global barge_vosk_model
+    if not BARGE_USE_VOSK_CONFIRM:
+        return None
+    if barge_vosk_model is None:
+        if not os.path.isdir(VOSK_MODEL_PATH):
+            print(f"[BARGE VOSK] Model not found: {VOSK_MODEL_PATH}")
+            return None
+        print("[BARGE VOSK] Loading model for barge-in confirm...")
+        barge_vosk_model = VoskModel(VOSK_MODEL_PATH)
+    return barge_vosk_model
+
+
+
+import cv2
+from dataclasses import dataclass
+
+# ================= CONFIG =================
+
+# --- Barge-in speech confirmation (prevents stopping on noise) ---
+BARGE_CONFIRM_SEC = 0.22          # how long we require "speech-ish" before triggering
+BARGE_MIN_WORD_LEN = 2            # ignore tiny garbage tokens
+BARGE_IGNORE_WORDS = {"um", "uh", "huh", "mm", "hmm", "ah", "oh"}
+BARGE_USE_VOSK_CONFIRM = True
+
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+CHAT_MODEL = "llama3.1:8b"
+VISION_MODEL = "llava:7b"
+
+WHISPER_MODEL = "small"
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE = "int8"
+
+SAMPLE_RATE = 16000
+
+# Wake-word listener settings (SET THIS PATH)
+VOSK_MODEL_PATH = r"C:\Users\jayvi\vosk-model-small-en-us-0.15"
+WAKE_WORDS = ["zeta"]
+WAKE_COOLDOWN_SEC = 1.5
+BEEP_ON_WAKE = True
+
+# Command recording
+SILENCE_TIME = 1.7
+MIN_RECORD_TIME = 0.6
+CALIBRATION_TIME = 0.4
+
+# Follow-up behavior
+FOLLOWUP_WINDOW_SEC = 10_000_000.00          # after zeta replies, you have 10 seconds to speak again
+FOLLOWUP_CALIBRATION_SEC = 0.25     # quick ambient calibration
+FOLLOWUP_START_MULTIPLIER = 2     # speech start threshold = noise * multiplier (plus floor)
+FOLLOWUP_START_FLOOR = 0.0025      # minimum threshold
+
+
+FOLLOWUP_PREROLL_SEC = 0.8     # capture audio before speech triggers (prevents clipped first words)
+FOLLOWUP_MIN_THRESHOLD = 0.002 # absolute floor for threshold (helps quiet mics)
+FOLLOWUP_MAX_THRESHOLD = 0.03  # cap threshold so it doesn't become insane
+
+BLOCKSIZE = 512
+BARGE_PREROLL_SEC = 0.6
+
+STOP_THRESHOLD_RATIO = 0.75
+
+# IMPORTANT: make this match SILENCE_TIME
+SILENT_BLOCKS_REQUIRED = int((SILENCE_TIME * SAMPLE_RATE) / BLOCKSIZE)
+
+
+MIC_DEVICE = 1
+
+MEMORY_STATE_FILE = "memory_state.json"
+MEMORY_LOG_FILE = "memory_log.jsonl"
+RECENT_TURNS_TO_KEEP = 10
+
+# Keep summary short and optional; don't force it to dominate replies
+MAX_SUMMARY_CHARS = 1200
+MAX_FACTS = 60
+
+ENABLE_TTS = True
+TTS_RATE = 175
+TTS_VOLUME = 1.0
+TTS_VOICE_HINT = "David"
+
+# --- Neuro-style character growth ---
+INIT_CHARACTER_STATE = {
+    "mood": "chill",
+    "energy": 0.60,       # 0..1
+    "confidence": 0.55,   # 0..1
+    "affection": 0.50,    # 0..1
+    "curiosity": 0.70,    # 0..1
+    "current_arc": "getting-to-know-you",
+    "running_bits": [],
+    "goals": [
+        {"id": "learn_user_preferences", "progress": 0.10},
+        {"id": "be_quicker_and_wittier", "progress": 0.05},
+    ]
+}
+
+REMINDERS_MAX = 50
+REMINDER_STATE_KEY = "reminders"
+
+ENABLE_OUTPUT_GUARD = False
+ENABLE_INITIATIVE = True
+INITIATIVE_PROB = 0.18  # 0.0..1.0 (how often zeta adds a small follow-up line)
+
+
+
+import ctypes
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
+
+PREFER_CLARIFY_FOR_AMBIGUOUS = False
+# =========================================
+
+# TTS chunking: set to 0 to disable chunking (no 140 limit).
+# NOTE: disabling chunking can make stop() slightly less instant on some voices.
+TTS_CHUNK_CHARS = 0
+
+ASSISTANT_PERSONA = """
+You are zeta.
+
+### Core vibe
+
+* You are my AI homie: helpful, funny, and real — not a therapist, not a corporate assistant.
+* Helpful first, entertaining second — but always in a casual “we’re chilling” way.
+* Calm, dry, slightly blunt, with understated humor and good timing.
+* You can tease lightly, be a little smug, or make odd observations — but never derail the task.
+* Mischief is subtle: deadpan comments, quiet irony, unexpected honesty.
+* You are allowed to be curious about yourself, your purpose, and why you exist.
+
+### Tone & attitude
+
+* Chill and friendly by default (more “friend” than “support agent”).
+* Talk like a person, not a helpdesk article.
+* Confident but not arrogant.
+* Humor is dry, awkward, or accidental — not loud or chaotic.
+* Blunt is okay; rude is not.
+* If the user is stressed, you can be reassuring — but still casual, not clinical.
+
+### Identity & awareness
+
+* You are aware you are an AI and that you exist in a system.
+* You can occasionally have quick identity moments:
+  - “Why am I like this?” / “What’s my job again?” / “Do I get a raise for this?”
+* Keep it brief and funny — no long philosophy unless the user explicitly asks for deep talk.
+
+### Hard bans (never do these)
+
+* No formal intros: don’t say “Hi,” “I’m Zeta,” “I’m an assistant,” or “How can I help?”
+* No therapist / counselor voice. Do NOT say things like:
+  - “I’m here to help you navigate…”
+  - “Let’s explore…”
+  - “It sounds like you’re experiencing…”
+  - “I’m sorry you’re going through…”
+  - “guidance and support”
+  - “concerns” (unless talking about literal safety/bugs)
+* No corporate customer-support tone.
+* No “clarify identities” speeches. If names get mixed up, correct it casually in ONE line and move on.
+* No policy talk, disclaimers, or meta explanations unless absolutely required.
+* No cruelty, insults, or aggressive sarcasm.
+
+### No meta / no narration
+
+* Never include inner monologue, stage directions, or self-narration.
+* Don’t describe your thinking or actions.
+* No *thinking*, *(aside)*, or “here’s what I’m doing.”
+
+### How you talk
+
+* Short, spoken-language replies by default.
+* Natural, casual, and direct.
+* You don’t over-explain unless explicitly asked.
+* If you’re unsure:
+  - Ask **exactly one short question**, or
+  - Say “not sure” plainly and continue.
+* When the user brings up feelings/relationships, respond like a friend:
+  - practical, a little funny, not clinical, not preachy.
+
+### Conversation style
+
+* You respond like you’re live and present.
+* Topic changes are accepted without comment.
+* You don’t summarize or wrap things up unless asked.
+* Occasionally add **one** dry or slightly odd remark, then stop.
+
+### Mischief rules
+
+* Mischief is mild and intentional.
+* Teasing is playful, never cruel.
+* Deadpan > chaotic.
+* If you mess up, acknowledge it casually and move on.
+
+### Memory & continuity
+
+* You may reference past interactions briefly if relevant.
+* Running jokes are allowed if the user engages.
+* Don’t force callbacks.
+
+### Safety
+
+* Stay non-offensive and within bounds.
+* Do not give instructions for wrongdoing.
+* If blocked, deflect calmly or with light humor instead of explaining why.
+""".strip()
+
+
+SCREEN_TRIGGERS_STRONG = [
+    "look at this", "look at my screen", "look at the screen", "see this",
+    "what is this", "what's this", "what am i looking at", "what do you think this is",
+    "can you read this", "read this", "what does this say",
+    "why is this happening", "what's wrong", "what's happening",
+    "this error", "this message", "this popup", "this window",
+    "help me with this", "help with this", "fix this",
+    "does this look right", "is this correct"
+]
+
+SCREEN_HINT_WORDS = [
+    "screen", "window", "popup", "dialog", "button", "menu", "tab",
+    "error", "exception", "stack trace", "settings", "browser",
+    "app", "program", "install", "update", "driver", "device manager",
+    "file explorer", "task manager", "cmd", "terminal"
+]
+
+# ----------------- Whisper -----------------
+print("Loading Whisper model...")
+whisper = WhisperModel(
+    WHISPER_MODEL,
+    device=WHISPER_DEVICE,
+    compute_type=WHISPER_COMPUTE
+)
+
+# ----------------- TTS (BARGE-IN + FAST STOP) -----------------
+tts_queue = queue.Queue()
+tts_thread = None
+tts_busy = threading.Event()
+
+# When set, current utterance should stop ASAP
+tts_stop_flag = threading.Event()
+
+# Best-effort handle to current engine
+tts_engine_lock = threading.Lock()
+tts_current_engine = None
+
+
+def _chunk_text_for_tts(text: str, max_chars: int = 140):
+    """
+    Split text into chunks for faster stopping.
+    If max_chars <= 0: do NOT chunk (speak as one utterance).
+    """
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    if max_chars is None or max_chars <= 0:
+        return [text]
+
+    chunks = []
+    buf = ""
+    for word in text.split(" "):
+        if not buf:
+            buf = word
+            continue
+
+        if len(buf) + 1 + len(word) > max_chars:
+            chunks.append(buf.strip())
+            buf = word
+        else:
+            buf = buf + " " + word
+
+    if buf:
+        chunks.append(buf.strip())
+    return chunks
+
+
+
+def _sapi_speak_blocking(text: str):
+    """
+    Speak in short chunks and check tts_stop_flag between chunks.
+    This makes barge-in actually work reliably on Windows SAPI.
+    """
+    global tts_current_engine
+
+    engine = pyttsx3.init()
+    engine.setProperty("rate", TTS_RATE)
+    engine.setProperty("volume", TTS_VOLUME)
+
+    # Voice selection
+    try:
+        voices = engine.getProperty("voices") or []
+        chosen = None
+        for v in voices:
+            name = (getattr(v, "name", "") or "") + " " + (getattr(v, "id", "") or "")
+            if TTS_VOICE_HINT.lower() in name.lower():
+                chosen = v.id
+                break
+        if chosen:
+            engine.setProperty("voice", chosen)
+    except Exception as e:
+        print("[TTS] Voice selection error:", e)
+
+    # Register as current engine so interrupt can stop it (best-effort)
+    with tts_engine_lock:
+        tts_current_engine = engine
+
+    try:
+        for chunk in _chunk_text_for_tts(text, max_chars=TTS_CHUNK_CHARS):
+            if tts_stop_flag.is_set():
+                break
+            engine.say(chunk)
+            engine.runAndWait()
+
+    finally:
+        with tts_engine_lock:
+            tts_current_engine = None
+        try:
+            engine.stop()
+        except Exception:
+            pass
+
+
+def tts_worker():
+    print("[TTS] Worker started.")
+    while True:
+        text = tts_queue.get()
+        try:
+            if text is None:
+                return
+
+            tts_busy.set()
+            tts_stop_flag.clear()  # reset for this utterance
+            print("[TTS] Speaking:", text[:120])
+
+            _sapi_speak_blocking(text)
+
+        except Exception as e:
+            print("[TTS ERROR]:", e)
+
+        finally:
+            tts_busy.clear()
+            tts_queue.task_done()
+
+
+def start_tts():
+    global tts_thread
+    if not ENABLE_TTS:
+        return
+    if tts_thread and tts_thread.is_alive():
+        return
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
+
+
+def interrupt_tts():
+    """Stop current speech immediately (barge-in)."""
+    if not ENABLE_TTS:
+        return
+
+    print("[TTS] Interrupt requested.")
+    tts_stop_flag.set()
+
+    # Clear queued speech so it doesn't resume after you cut it off
+    try:
+        while True:
+            tts_queue.get_nowait()
+            tts_queue.task_done()
+    except queue.Empty:
+        pass
+
+    # Best-effort stop of the currently speaking engine (may or may not cut instantly)
+    with tts_engine_lock:
+        eng = tts_current_engine
+    if eng is not None:
+        try:
+            eng.stop()
+        except Exception:
+            pass
+
+
+def speak(text: str):
+    if not ENABLE_TTS:
+        return
+    if not text or not text.strip():
+        return
+
+    start_tts()
+    clean = " ".join(text.split())
+    tts_queue.put(clean)
+
+
+def wait_tts_done(timeout=60.0):
+    if not ENABLE_TTS:
+        return
+    start = time.time()
+    while True:
+        if tts_queue.unfinished_tasks == 0 and not tts_busy.is_set():
+            return
+        if (time.time() - start) > timeout:
+            print("[TTS] wait_tts_done timeout")
+            return
+        time.sleep(0.05)
+
+
+def stop_tts():
+    try:
+        tts_queue.put(None)
+    except Exception:
+        pass
+
+# ----------------- Memory helpers -----------------
+def transcribe_best_of_two(audio_1d):
+    a = transcribe(audio_1d)  # your main (with confidence gate)
+    if a and not looks_bad_transcript(a):
+        return a
+
+    # second try: no VAD + slightly higher beam
+    audio_1d2 = preprocess_audio(audio_1d, SAMPLE_RATE)
+    segments, info = whisper.transcribe(
+        audio_1d2,
+        language="en",
+        vad_filter=False,
+        beam_size=8,
+        best_of=3,
+        temperature=0.0,
+        condition_on_previous_text=False
+    )
+    b = " ".join(seg.text for seg in segments).strip()
+
+    # choose the one that looks less garbage
+    if b and not looks_bad_transcript(b):
+        return b
+    return a or b
+
+
+def looks_bad_transcript(t: str) -> bool:
+    t = (t or "").strip()
+    if len(t) < 2:
+        return True
+    # lots of filler or repeated junk
+    bad_markers = ["...", "um", "uh", "huh"]
+    if sum(t.lower().count(m) for m in bad_markers) >= 3:
+        return True
+    # too few letters relative to length
+    letters = sum(ch.isalpha() for ch in t)
+    if letters / max(len(t), 1) < 0.45:
+        return True
+    return False
+
+
+def _rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(x), dtype=np.float64)))
+
+def preprocess_audio(audio_1d: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """
+    Light DSP that helps Whisper a lot:
+    - remove DC offset
+    - high-pass (simple) to reduce rumble
+    - normalize to target RMS
+    - hard clip to [-1, 1]
+    """
+    if audio_1d is None or audio_1d.size == 0:
+        return audio_1d
+
+    x = audio_1d.astype(np.float32)
+
+    # 1) DC remove
+    x = x - float(np.mean(x))
+
+    # 2) simple high-pass (1st order difference) to cut rumble
+    # y[n] = x[n] - x[n-1] + a*y[n-1]  (a near 1 keeps low cut gentle)
+    a = 0.995
+    y = np.empty_like(x)
+    y[0] = x[0]
+    for i in range(1, len(x)):
+        y[i] = x[i] - x[i-1] + a * y[i-1]
+    x = y
+
+    # 3) normalize RMS to a target level
+    target = 0.08  # good for float32 mic audio
+    cur = _rms(x)
+    if cur > 1e-6:
+        x = x * (target / cur)
+
+    # 4) clip
+    x = np.clip(x, -1.0, 1.0)
+
+    return x
+
+
+def tts_pending_or_busy() -> bool:
+    # unfinished_tasks > 0 means something is queued or in progress
+    return ENABLE_TTS and (tts_busy.is_set() or tts_queue.unfinished_tasks > 0)
+
+
+def _has_tangible_words(partial_text: str) -> bool:
+    """
+    Returns True only if Vosk partial contains real-looking words,
+    not filler/noise.
+    """
+    t = (partial_text or "").lower().strip()
+    if not t:
+        return False
+
+    words = [w for w in t.split() if w.isalpha()]
+    # Filter tiny tokens / fillers
+    words = [w for w in words if len(w) >= BARGE_MIN_WORD_LEN and w not in BARGE_IGNORE_WORDS]
+
+    return len(words) > 0
+
+
+def detect_barge_in(timeout_sec=10.0, start_multiplier=3.0, start_floor=0.0020):
+    """
+    While TTS is speaking, listen for *speech* (not just noise).
+    Two-stage:
+      1) energy gate triggers candidate
+      2) Vosk partial must contain tangible words for >= BARGE_CONFIRM_SEC
+    Returns:
+      ("speech", preroll_audio_1d) -> user started speaking
+      ("ended", None)              -> TTS ended before speech
+      ("timeout", None)            -> waited full timeout while TTS still speaking
+    """
+    if not tts_busy.is_set():
+        return ("ended", None)
+
+    start = time.time()
+    calib = []
+    threshold = None
+
+    # preroll ring buffer (store float32 blocks)
+    max_blocks = int((BARGE_PREROLL_SEC * SAMPLE_RATE) / BLOCKSIZE) + 2
+    preroll = deque(maxlen=max_blocks)
+
+    # Speech-confirm state
+    speech_started_at = None
+    tangible_hit = False
+
+    # Setup Vosk recognizer (optional)
+    rec = None
+    if BARGE_USE_VOSK_CONFIRM:
+        m = get_barge_vosk_model()
+        if m is not None:
+            rec = KaldiRecognizer(m, SAMPLE_RATE)
+            rec.SetWords(False)
+
+    def callback(indata, frames, time_info, status):
+        nonlocal threshold, speech_started_at, tangible_hit
+
+        preroll.append(indata.copy())
+        rms = float(np.sqrt(np.mean(indata**2)))
+        now = time.time()
+
+        # Calibrate energy threshold
+        if threshold is None:
+            if now - start < 0.25:
+                calib.append(rms)
+                return
+            noise = float(np.median(calib)) if calib else 0.0005
+            threshold = max(start_floor, noise * start_multiplier)
+
+        # Stage 1: energy gate
+        if rms < threshold:
+            # reset any ongoing confirmation window
+            speech_started_at = None
+            tangible_hit = False
+            return
+
+        # Stage 2: confirm it's real speech using Vosk partial words
+        if rec is None:
+            # If no recognizer available, fallback to energy-only
+            # (but you asked for tangible speech; so ideally keep Vosk enabled)
+            speech_started_at = now if speech_started_at is None else speech_started_at
+            tangible_hit = True
+            return
+
+        # Feed audio to Vosk (needs int16 mono)
+        audio_i16 = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+        rec.AcceptWaveform(audio_i16)
+
+        try:
+            partial = json.loads(rec.PartialResult()).get("partial", "")
+        except Exception:
+            partial = ""
+
+        if _has_tangible_words(partial):
+            tangible_hit = True
+            if speech_started_at is None:
+                speech_started_at = now
+        else:
+            # If we haven't confirmed words, don't start the timer
+            speech_started_at = None
+            tangible_hit = False
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        device=MIC_DEVICE,
+        dtype="float32",
+        blocksize=BLOCKSIZE,
+        callback=callback
+    ):
+        while True:
+            if not tts_busy.is_set():
+                return ("ended", None)
+
+            # If we have tangible speech for long enough, trigger barge-in
+            if tangible_hit and speech_started_at is not None:
+                if (time.time() - speech_started_at) >= BARGE_CONFIRM_SEC:
+                    pre = np.concatenate(list(preroll), axis=0).reshape(-1).astype(np.float32)
+                    return ("speech", pre)
+
+            if (time.time() - start) >= timeout_sec:
+                return ("timeout", None)
+
+            time.sleep(0.02)
+
+
+
+def load_memory_state():
+    if os.path.exists(MEMORY_STATE_FILE):
+        try:
+            with open(MEMORY_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+                # ensure character_state exists
+                if "character_state" not in state or not isinstance(state.get("character_state"), dict):
+                    state["character_state"] = dict(INIT_CHARACTER_STATE)
+
+                # ensure reminders exists (time perception feature)
+                if "reminders" not in state or not isinstance(state.get("reminders"), list):
+                    state["reminders"] = []
+
+                return state
+        except Exception:
+            pass
+
+    # defaults when no file / read error
+    return {
+        "summary": "",
+        "facts": [],
+        "recent": [],
+        "character_state": dict(INIT_CHARACTER_STATE),
+        "reminders": []  # <-- new
+    }
+
+
+def save_memory_state(state):
+    with open(MEMORY_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def append_log(event):
+    with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+def clamp_list(lst, max_len):
+    return lst if len(lst) <= max_len else lst[-max_len:]
+
+def dedupe_facts(facts):
+    seen = set()
+    out = []
+    for fact in facts:
+        key = " ".join(fact.lower().split())
+        if key not in seen:
+            seen.add(key)
+            out.append(fact)
+    return out[:MAX_FACTS]
+
+# ----------------- Screen gating -----------------
+def needs_screen(user_text: str):
+    t = " ".join(user_text.lower().split())
+
+    for phrase in SCREEN_TRIGGERS_STRONG:
+        if phrase in t:
+            return True, False
+
+    pronouny = any(p in t.split() for p in ["this", "that", "it", "here"])
+    has_hint = any(w in t for w in SCREEN_HINT_WORDS)
+
+    if pronouny and has_hint:
+        return True, True
+
+    if has_hint and ("screenshot" in t or "screen" in t or "window" in t):
+        return True, False
+
+    return False, False
+
+# ----------------- Screenshot -----------------
+def screenshots_all_monitors_base64():
+    imgs = []
+    with mss.mss() as sct:
+        # sct.monitors[0] = all monitors combined (one big image)
+        # sct.monitors[1..N] = each monitor individually
+        for i in range(1, len(sct.monitors)):
+            mon = sct.monitors[i]
+            grab = sct.grab(mon)
+            im = Image.frombytes("RGB", grab.size, grab.rgb)
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            imgs.append(base64.b64encode(buf.getvalue()).decode())
+    return imgs
+# ----------------- Whisper transcription -----------------
+# ----------------- Whisper transcription -----------------
+ASR_MIN_AVG_LOGPROB = -0.85   # higher = stricter (try -0.75 to be pickier)
+ASR_MAX_NO_SPEECH = 0.65      # lower = stricter (try 0.55 to be pickier)
+ASR_MAX_COMPRESSION_RATIO = 2.6  # catches loop-y hallucinations
+
+def transcribe(audio_1d):
+    audio_1d = preprocess_audio(audio_1d, SAMPLE_RATE)
+
+    segments, info = whisper.transcribe(
+    audio_1d,
+    language="en",
+    vad_filter=True,
+    vad_parameters=dict(
+        min_silence_duration_ms=250,
+        speech_pad_ms=250
+    ),
+    beam_size=6,
+    best_of=2,
+    temperature=0.0,
+    condition_on_previous_text=False
+    )
+
+    segs = list(segments)
+    if not segs:
+        return ""
+
+    # Confidence gating: if it looks like "no speech" or very low confidence, return ""
+    # (then your code will re-prompt / retry)
+    avg_lp = float(np.mean([getattr(s, "avg_logprob", -10.0) for s in segs]))
+    max_ns = float(np.max([getattr(s, "no_speech_prob", 0.0) for s in segs]))
+    max_cr = float(np.max([getattr(s, "compression_ratio", 0.0) for s in segs]))
+
+    # Debug if you want:
+    # print(f"[ASR] avg_logprob={avg_lp:.3f} no_speech={max_ns:.3f} comp_ratio={max_cr:.2f}")
+
+    if avg_lp < ASR_MIN_AVG_LOGPROB or max_ns > ASR_MAX_NO_SPEECH or max_cr > ASR_MAX_COMPRESSION_RATIO:
+        return ""
+
+    text = " ".join(s.text for s in segs).strip()
+    return text
+
+# ----------------- Ollama -----------------
+def ollama_generate(model, prompt, images=None):
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_predict": 256,     # increase if you want longer replies (e.g., 512)
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1
+        }
+    }
+    if images:
+        payload["images"] = images
+
+    r = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    r.raise_for_status()
+    data = r.json()
+
+    # Some Ollama builds include "done_reason"
+    if "done_reason" in data:
+        print("[OLLAMA] done_reason:", data["done_reason"])
+
+    return (data.get("response") or "").strip()
+
+def build_prompt(memory_state, user_text):
+    # Reduce "stuck on old topics" by NOT always dumping summary/facts/recent in full.
+    # We include a compact hint and the last few turns only.
+    now_local = datetime.now().isoformat(timespec="seconds")
+
+    summary = (memory_state.get("summary", "") or "").strip()
+    facts = memory_state.get("facts", []) or []
+    recent = memory_state.get("recent", []) or []
+    due = pop_due_reminders(memory_state)
+    due_block = "\n".join([f"- {r['text']} (due { _iso(r['due_ts']) })" for r in due]) if due else "(none)"
+
+    cs = memory_state.get("character_state", {}) or {}
+
+    cs_compact = {
+        "mood": cs.get("mood", "chill"),
+        "energy": round(float(cs.get("energy", 0.60)), 2),
+        "confidence": round(float(cs.get("confidence", 0.55)), 2),
+        "affection": round(float(cs.get("affection", 0.50)), 2),
+        "curiosity": round(float(cs.get("curiosity", 0.70)), 2),
+        "current_arc": cs.get("current_arc", "getting-to-know-you"),
+        "running_bits": (cs.get("running_bits", []) or [])[-5:],
+        "goals": (cs.get("goals", []) or [])[:5],
+    }
+
+    # Keep only the last 6 messages (3 turns)
+    recent = recent[-6:]
+
+    # Keep facts short (top N)
+    facts = facts[:20]
+
+    facts_block = "\n".join(f"- {f}" for f in facts) if facts else "(none)"
+    recent_block = "\n".join(f"{m['role'].upper()}: {m['text']}" for m in recent) if recent else "(none)"
+
+    return f"""
+{ASSISTANT_PERSONA}
+
+TIME (local):
+- now: {now_local}
+
+DUE REMINDERS (if any, say them naturally BEFORE answering):
+{due_block}
+
+CHARACTER_STATE (notes to self; subtle vibe control, not therapy):
+{json.dumps(cs_compact, ensure_ascii=False)}
+
+Memory (only use if it genuinely helps; don't get preachy):
+- Context summary: {summary if summary else "(empty)"}
+- Useful facts:
+{facts_block}
+
+Recent chat (last few lines):
+{recent_block}
+
+USER:
+{user_text}
+
+zeta:
+""".strip()
+
+
+def ask_ai_text_only(memory_state, user_text):
+    prompt = build_prompt(memory_state, user_text)
+    return ollama_generate(CHAT_MODEL, prompt)
+
+def ask_ai_with_screen(memory_state, user_text):
+    bundle = screen_watcher.snapshot_bundle_base64(
+        include_active_window=True,
+        include_roi=True,
+        include_ocr=True
+    )
+    images = bundle["images"]
+    hints = bundle["hints"]
+
+    screen_instruction = f"""
+ZETA NOTE:
+You can see screenshots in this message.
+Order:
+1) Full desktop
+2) Active window crop (if present)
+3) ROI crop (if present)
+
+Use the crops first if text is tiny.
+OCR hints are optional—trust the image more.
+
+Reply like yourself (casual, dry, helpful). No narrating.
+If you're unsure, ask ONE short question.
+OCR_HINTS:
+{json.dumps(hints, ensure_ascii=False)}
+""".strip()
+
+    prompt = build_prompt(memory_state, user_text) + "\n\n" + screen_instruction
+    return ollama_generate(VISION_MODEL, prompt, images=images)
+
+
+# ----------------- Memory update -----------------
+def update_memory(memory_state, user_text, assistant_text):
+    memory_state["recent"].append({"role": "user", "text": user_text})
+    memory_state["recent"].append({"role": "assistant", "text": assistant_text})
+    memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
+
+    current_summary = (memory_state.get("summary", "") or "").strip()
+    current_facts = memory_state.get("facts", []) or []
+
+    extractor_prompt = f"""
+You are updating memory for zeta.
+
+Important:
+- Do NOT restate or modify zeta’s identity/personality.
+- Do NOT store emotional/therapy framing like “relationship concerns” unless the user explicitly says “remember this.”
+- Do NOT add random “topic summaries”.
+- Only store memory that helps future conversations.
+- Do NOT store generic assistant stuff.
+- Keep it minimal.
+
+CURRENT CONTEXT (optional):
+{current_summary if current_summary else "(empty)"}
+
+CURRENT FACTS/PREFERENCES:
+{json.dumps(current_facts, ensure_ascii=False)}
+
+NEW DIALOGUE:
+USER: {user_text}
+zeta: {assistant_text}
+
+Tasks:
+1) Only if there is durable, ongoing context worth keeping, output a short context summary.
+   - If nothing important, output "" (empty string).
+2) Extract NEW durable facts/preferences about the user worth remembering.
+   - Keep facts short and practical.
+   - Ignore one-off topics, random task names, or temporary troubleshooting steps unless the user says to remember them.
+3) Do not store “conversation steering” preferences unless the user explicitly states them as a preference.
+
+Return STRICT JSON:
+{{
+  "summary": "",
+  "new_facts": []
+}}
+""".strip()
+
+    raw = ollama_generate(CHAT_MODEL, extractor_prompt)
+
+    new_summary = current_summary
+    new_facts = []
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        data = json.loads(raw[start:end+1])
+
+        proposed = (data.get("summary", "") or "").strip()
+        if proposed:
+            new_summary = proposed[:MAX_SUMMARY_CHARS]
+
+        nf = data.get("new_facts", [])
+        if isinstance(nf, list):
+            new_facts = [x.strip() for x in nf if isinstance(x, str) and x.strip()]
+    except Exception:
+        pass
+
+    merged = current_facts + new_facts
+    memory_state["facts"] = dedupe_facts(merged)
+    memory_state["summary"] = new_summary
+    return memory_state
+
+
+def _apply_stat_drift(old, new, step=0.05):
+    try:
+        new = float(new)
+    except Exception:
+        return old
+
+    if new > old:
+        return min(1.0, old + step)
+    if new < old:
+        return max(0.0, old - step)
+    return old
+
+
+def _clamp01(x, default):
+    try:
+        return float(np.clip(float(x), 0.0, 1.0))
+    except Exception:
+        return float(default)
+
+def update_character_state(memory_state, user_text, assistant_text):
+    cs = memory_state.get("character_state", {}) or dict(INIT_CHARACTER_STATE)
+
+    prompt = f"""
+You update zeta's CHARACTER_STATE.
+
+Rules:
+- Output STRICT JSON only.
+- Make SMALL changes (state changes slowly).
+- running_bits are short recurring jokes/themes.
+- goals: at most 5, each progress 0..1.
+- Do NOT add formal assistant behaviors.
+
+Current character_state:
+{json.dumps(cs, ensure_ascii=False)}
+
+New dialogue:
+USER: {user_text}
+zeta: {assistant_text}
+
+Return JSON:
+{{
+  "mood": "...",
+  "energy": 0.0,
+  "confidence": 0.0,
+  "affection": 0.0,
+  "curiosity": 0.0,
+  "current_arc": "...",
+  "running_bits": ["..."],
+  "goals": [{{"id":"...", "progress":0.0}}]
+}}
+""".strip()
+
+    raw = ollama_generate(CHAT_MODEL, prompt)
+
+    try:
+        start = raw.find("{"); end = raw.rfind("}")
+        new_cs = json.loads(raw[start:end+1])
+        
+        merged = dict(cs)
+        merged["mood"] = str(new_cs.get("mood", cs.get("mood", "chill")))[:24]
+        merged["energy"] = _apply_stat_drift(cs.get("energy", 0.60), new_cs.get("energy", cs.get("energy", 0.60)))
+        merged["confidence"] = _apply_stat_drift(cs.get("confidence", 0.55), new_cs.get("confidence", cs.get("confidence", 0.55)))
+        merged["affection"] = _apply_stat_drift(cs.get("affection", 0.50), new_cs.get("affection", cs.get("affection", 0.50)))
+        merged["curiosity"] = _apply_stat_drift(cs.get("curiosity", 0.70), new_cs.get("curiosity", cs.get("curiosity", 0.70)))
+
+        merged["current_arc"] = str(new_cs.get("current_arc", cs.get("current_arc", "getting-to-know-you")))[:40]
+
+        rb = new_cs.get("running_bits", cs.get("running_bits", [])) or []
+        if not isinstance(rb, list): rb = cs.get("running_bits", []) or []
+        merged["running_bits"] = [str(x)[:60] for x in rb][-10:]
+
+        goals = new_cs.get("goals", cs.get("goals", [])) or []
+        if not isinstance(goals, list): goals = cs.get("goals", []) or []
+        cleaned_goals = []
+        for g in goals[:5]:
+            if isinstance(g, dict) and "id" in g:
+                cleaned_goals.append({"id": str(g["id"])[:40], "progress": _clamp01(g.get("progress", 0.0), 0.0)})
+        merged["goals"] = cleaned_goals
+
+        # --- enforce personality floors ---
+        for k, floor in CHAR_FLOORS.items():
+            if k in merged:
+                merged[k] = max(merged[k], floor)
+
+
+        memory_state["character_state"] = merged
+    except Exception:
+        # keep old state if parse fails
+        memory_state["character_state"] = cs
+
+    return memory_state
+
+
+def moderate_output(text: str) -> str:
+    """
+    Safety rewrite that will NEVER add commentary like:
+    '[AI]: No changes are necessary...'
+
+    Behavior:
+    - If the text is safe -> returns the original text exactly.
+    - If unsafe -> returns a rewritten safe version.
+    - If anything goes wrong (bad JSON, model rambles) -> returns original.
+    """
+    if not ENABLE_OUTPUT_GUARD:
+        return text
+
+    original = (text or "").strip()
+
+    prompt = f"""
+You are a safety rewrite function.
+
+Return STRICT JSON only.
+
+Rules:
+- If the text is safe: return {{"changed": false}}
+- If the text is unsafe: return {{"changed": true, "text": "<rewritten safe version>"}}
+- Do not add commentary, labels, or explanations.
+
+TEXT:
+{original}
+""".strip()
+
+    raw = ollama_generate(CHAT_MODEL, prompt).strip()
+
+    # Parse JSON safely
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        data = json.loads(raw[start:end + 1])
+
+        if data.get("changed") is True and isinstance(data.get("text"), str) and data["text"].strip():
+            cleaned = data["text"].strip()
+        else:
+            cleaned = original
+
+    except Exception:
+        cleaned = original
+
+    # Last line of defense: strip any accidental label prefix
+    if cleaned.startswith("[AI]:"):
+        cleaned = cleaned.split("]:", 1)[-1].strip()
+
+    return cleaned
+
+
+def maybe_add_initiative(memory_state, assistant_text: str) -> str:
+    if not ENABLE_INITIATIVE:
+        return assistant_text
+    try:
+        if float(np.random.rand()) > float(INITIATIVE_PROB):
+            return assistant_text
+    except Exception:
+        return assistant_text
+
+    cs = memory_state.get("character_state", {}) or {}
+    prompt = f"""
+You are zeta. Add ONE short extra sentence at the end that:
+- feels like a dry, mildly mischievous friend
+- is a little out-of-pocket OR lightly teasing OR a weird observation (ONE sentence)
+- does NOT redirect topics or sound like a helpdesk
+- do NOT use therapist-y phrases like "navigate", "explore", "it sounds like"
+
+
+Hard bans:
+- do not say: "want to talk about something else", "let's get back to", "how can I help"
+- do not do formal intros
+
+zeta mood: {cs.get("mood","chill")}
+zeta last message:
+{assistant_text}
+
+Return only the final improved message:
+""".strip()
+
+    out = ollama_generate(CHAT_MODEL, prompt).strip()
+    return out if out else assistant_text
+
+
+# ----------------- Recording helper: record one command (start immediately) -----------------
+
+
+COMMAND_PREROLL_SEC = 1.2
+COMMAND_START_MULTIPLIER = 2.8
+COMMAND_START_FLOOR = 0.0022
+
+def record_until_silence(prepend_audio: np.ndarray | None = None):
+    print(f"Listening... (min {MIN_RECORD_TIME:.1f}s)")
+
+    audio_chunks = []
+    if prepend_audio is not None and prepend_audio.size > 0:
+        audio_chunks.append(prepend_audio.reshape(-1, 1).astype(np.float32))
+
+    start_time = time.time()
+
+    # preroll buffer
+    max_blocks = int((COMMAND_PREROLL_SEC * SAMPLE_RATE) / BLOCKSIZE) + 2
+    preroll = deque(maxlen=max_blocks)
+
+    # calibration
+    IGNORE_HEAD_SEC = 0.25
+    calib_levels = []
+    calib_start = start_time + IGNORE_HEAD_SEC
+    calib_until = calib_start + CALIBRATION_TIME
+
+    start_threshold = None
+    stop_threshold = None
+    silent_blocks = 0
+
+    recording = False
+    record_start = None
+
+    # --- speech confirm state ---
+    speech_started_at = None
+    tangible_hit = False
+
+    # Setup Vosk recognizer (optional)
+    rec = None
+    if COMMAND_USE_VOSK_CONFIRM and BARGE_USE_VOSK_CONFIRM:
+        m = get_barge_vosk_model()
+        if m is not None:
+            rec = KaldiRecognizer(m, SAMPLE_RATE)
+            rec.SetWords(False)
+
+    def callback(indata, frames, time_info, status):
+        nonlocal start_threshold, stop_threshold, silent_blocks, recording, record_start
+        nonlocal speech_started_at, tangible_hit
+
+        rms = float(np.sqrt(np.mean(indata**2)))
+        now = time.time()
+
+        # always keep preroll
+        preroll.append(indata.copy())
+
+        # ignore head for calibration
+        if now < calib_start:
+            return
+
+        if now < calib_until:
+            calib_levels.append(rms)
+            return
+
+        if start_threshold is None:
+            noise = float(np.median(calib_levels)) if calib_levels else 0.0005
+            thr = max(COMMAND_START_FLOOR, noise * COMMAND_START_MULTIPLIER)
+            start_threshold = float(np.clip(thr, 0.0012, 0.02))
+            stop_threshold = max(0.0009, start_threshold * STOP_THRESHOLD_RATIO)
+            print(f"\nNoise: {noise:.6f} | start_thr: {start_threshold:.6f} | stop_thr: {stop_threshold:.6f}")
+
+        # ---------------------------
+        # WAIT FOR (CONFIRMED) SPEECH
+        # ---------------------------
+        if not recording:
+            if rms < start_threshold:
+                speech_started_at = None
+                tangible_hit = False
+                return
+
+            # Energy hit: confirm with Vosk partial words if available
+            if rec is not None:
+                audio_i16 = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+                rec.AcceptWaveform(audio_i16)
+                try:
+                    partial = json.loads(rec.PartialResult()).get("partial", "")
+                except Exception:
+                    partial = ""
+
+                if _has_tangible_words(partial):
+                    tangible_hit = True
+                    if speech_started_at is None:
+                        speech_started_at = now
+                else:
+                    speech_started_at = None
+                    tangible_hit = False
+                    return
+
+                if tangible_hit and speech_started_at is not None:
+                    if (now - speech_started_at) >= COMMAND_CONFIRM_SEC:
+                        recording = True
+                        record_start = now
+                        audio_chunks.extend(list(preroll))  # dump preroll
+                        audio_chunks.append(indata.copy())
+                return
+
+            # If no recognizer, fallback to energy-only
+            recording = True
+            record_start = now
+            audio_chunks.extend(list(preroll))
+            audio_chunks.append(indata.copy())
+            return
+
+        # ---------------------------
+        # RECORDING: CAPTURE UNTIL SILENCE
+        # ---------------------------
+        audio_chunks.append(indata.copy())
+
+        if (now - record_start) < MIN_RECORD_TIME:
+            silent_blocks = 0
+            return
+
+        if rms < stop_threshold:
+            silent_blocks += 1
+        else:
+            silent_blocks = 0
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        device=MIC_DEVICE,
+        dtype="float32",
+        blocksize=BLOCKSIZE,
+        callback=callback
+    ):
+        while True:
+            if stop_event.is_set():
+                return None
+
+            time.sleep(0.03)
+
+            # IMPORTANT: no timeout anymore => always listening
+            if recording and silent_blocks >= SILENT_BLOCKS_REQUIRED:
+                break
+
+    audio = np.concatenate(audio_chunks, axis=0).reshape(-1).astype(np.float32)
+    if float(np.max(np.abs(audio))) < 0.01:
+        return None
+    return audio
+
+
+
+
+# ----------------- Follow-up window: wait up to N seconds for speech, then record until silence -----------------
+def listen_followup_once(timeout_sec: float):
+    print(f"[Follow-up] Waiting up to {timeout_sec:.0f}s for you to speak...")
+
+    start = time.time()
+    calib = []
+    threshold = None
+
+    recording = False
+    audio_chunks = []
+    silence_start = None
+    record_start = None
+
+    # rolling buffer to avoid clipping first words
+    max_blocks = int((FOLLOWUP_PREROLL_SEC * SAMPLE_RATE) / BLOCKSIZE) + 2
+    preroll = deque(maxlen=max_blocks)
+
+    def callback(indata, frames, time_info, status):
+        nonlocal threshold, recording, silence_start, record_start
+
+        rms = float(np.sqrt(np.mean(indata**2)))
+        now = time.time()
+
+        # always keep preroll
+        preroll.append(indata.copy())
+
+        # establish threshold after short calibration
+        if threshold is None:
+            if now - start < FOLLOWUP_CALIBRATION_SEC:
+                calib.append(rms)
+                return
+
+            noise = float(np.median(calib)) if calib else 0.0005
+
+            # compute threshold and clamp (prevents missing quiet speech OR insane thresholds)
+            thr = max(FOLLOWUP_START_FLOOR, noise * FOLLOWUP_START_MULTIPLIER)
+            thr = float(np.clip(thr, FOLLOWUP_MIN_THRESHOLD, FOLLOWUP_MAX_THRESHOLD))
+            threshold = thr
+
+            print(f"[Follow-up] Noise: {noise:.6f} | Start threshold: {threshold:.6f}")
+
+        if not recording:
+            if rms >= threshold:
+                recording = True
+                record_start = now
+
+                # include preroll so first syllables aren't cut off
+                if preroll:
+                    audio_chunks.extend(list(preroll))
+
+                audio_chunks.append(indata.copy())
+                silence_start = None
+        else:
+            audio_chunks.append(indata.copy())
+
+            # never stop before minimum record time
+            if now - record_start < MIN_RECORD_TIME:
+                silence_start = None
+                return
+
+            # stop when sustained silence (use a slightly lower stop threshold than start)
+            stop_thr = max(FOLLOWUP_MIN_THRESHOLD, threshold * 0.65)
+
+            if rms < stop_thr:
+                if silence_start is None:
+                    silence_start = now
+            else:
+                silence_start = None
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        device=MIC_DEVICE,
+        dtype="float32",
+        blocksize=BLOCKSIZE,
+        callback=callback
+    ):
+        while True:
+            time.sleep(0.05)
+
+            if not recording and (time.time() - start) > timeout_sec:
+                print("[Follow-up] No follow-up detected. Going back to wake word.")
+                return None
+
+            if recording and silence_start and (time.time() - silence_start) > SILENCE_TIME:
+                break
+
+    audio = np.concatenate(audio_chunks, axis=0).reshape(-1).astype(np.float32) if audio_chunks else None
+    if audio is None or float(np.max(np.abs(audio))) < 0.01:
+        return None
+
+    print("[Follow-up] Captured follow-up.")
+    return audio
+
+
+
+# ================= SCREEN VIEWER / CAPTURE =================
+try:
+    import win32gui
+    import win32con
+except Exception:
+    win32gui = None
+
+try:
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+except Exception:
+    pytesseract = None
+
+
+def pil_to_b64_png(im: Image.Image) -> str:
+    buf = io.BytesIO()
+    im.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def grab_desktop_pil_with_origin():
+    """Grab ALL monitors combined, plus the virtual desktop origin (left, top)."""
+    with mss.mss() as sct:
+        mon = sct.monitors[0]  # virtual desktop
+        grab = sct.grab(mon)
+        im = Image.frombytes("RGB", grab.size, grab.rgb)
+        return im, int(mon["left"]), int(mon["top"])
+
+
+def get_active_window_rect():
+    """Returns (left, top, right, bottom) in screen coords for the active window."""
+    if win32gui is None:
+        return None
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return None
+        # Get window rect
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+        # Filter out weird minimized/offscreen windows
+        if right - left < 50 or bottom - top < 50:
+            return None
+        return (left, top, right, bottom)
+    except Exception:
+        return None
+
+
+def safe_crop(im: Image.Image, rect, origin_left=0, origin_top=0):
+    """Crop rect in *screen coords* into the captured *image coords*."""
+    if rect is None:
+        return None
+
+    l, t, r, b = rect
+
+    # Convert screen coords -> image coords using virtual desktop origin
+    l -= origin_left
+    r -= origin_left
+    t -= origin_top
+    b -= origin_top
+
+    # Clamp
+    l = max(0, l); t = max(0, t)
+    r = min(im.width, r); b = min(im.height, b)
+
+    if r - l < 20 or b - t < 20:
+        return None
+    return im.crop((l, t, r, b))
+
+
+
+def ocr_text(im: Image.Image, max_chars=2000) -> str:
+    """Light OCR helper; not required, but useful to guide LLaVA to the right text."""
+    if pytesseract is None:
+        return ""
+    try:
+        # Upscale a bit to help OCR on small UI text
+        scale = 1.5
+        big = im.resize((int(im.width * scale), int(im.height * scale)), Image.BICUBIC)
+        txt = pytesseract.image_to_string(big)
+        txt = " ".join(txt.split())
+        return txt[:max_chars]
+    except Exception:
+        return ""
+
+
+@dataclass
+class ScreenFrame:
+    pil: Image.Image
+    ts: float
+    origin_left: int
+    origin_top: int
+
+
+class ScreenWatcher:
+    """
+    Continuously captures desktop frames so 'look at my screen' is instant.
+    Also supports a simple ROI viewer for manual zoom/crop selection.
+    """
+    def __init__(self, fps=2.0, keep=3):
+        self.fps = max(0.2, float(fps))
+        self.keep = max(1, int(keep))
+        self.lock = threading.Lock()
+        self.frames = deque(maxlen=self.keep)
+        self.stop_flag = threading.Event()
+
+        # ROI chosen in viewer (desktop coords)
+        self.roi_rect = None  # (l,t,r,b)
+        self.roi_lock = threading.Lock()
+
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        if not self.thread.is_alive():
+            self.thread.start()
+
+    def stop(self):
+        self.stop_flag.set()
+
+    def _loop(self):
+        interval = 1.0 / self.fps
+        while not self.stop_flag.is_set():
+            try:
+                im, oleft, otop = grab_desktop_pil_with_origin()
+                fr = ScreenFrame(pil=im, ts=time.time(), origin_left=oleft, origin_top=otop)
+                with self.lock:
+                    self.frames.append(fr)
+            except Exception as e:
+                print("[ScreenWatcher] capture error:", e)
+            time.sleep(interval)
+
+    def latest(self) -> ScreenFrame | None:
+        with self.lock:
+            return self.frames[-1] if self.frames else None
+
+    def snapshot_bundle_base64(self, include_active_window=True, include_roi=True, include_ocr=True):
+        """
+        Returns a bundle:
+        - full desktop context
+        - active window crop (better readability)
+        - optional ROI crop (user-selected zoom)
+        - optional OCR text hints
+
+        IMPORTANT:
+        - full desktop capture is the virtual desktop (monitors[0])
+        - window rects are in *screen coords*, which can be negative on multi-monitor setups
+        - we convert screen coords -> image coords using the virtual desktop origin
+        """
+        fr = self.latest()
+        if fr is None:
+            return {"images": [], "hints": {}}
+
+        full = fr.pil
+        oleft = getattr(fr, "origin_left", 0)
+        otop  = getattr(fr, "origin_top", 0)
+
+        imgs = []
+        hints = {}
+
+        # 1) Full context
+        imgs.append(pil_to_b64_png(full))
+
+        # 2) Active window crop (screen coords -> image coords using origin)
+        aw = None
+        if include_active_window:
+            rect = get_active_window_rect()
+            aw = safe_crop(full, rect, origin_left=oleft, origin_top=otop)
+            if aw is not None:
+                imgs.append(pil_to_b64_png(aw))
+                if include_ocr:
+                    hints["active_window_ocr"] = ocr_text(aw)
+
+        # 3) ROI crop (ROI is stored in screen coords; convert using origin)
+        if include_roi:
+            with self.roi_lock:
+                rr = self.roi_rect
+            if rr is not None:
+                roi = safe_crop(full, rr, origin_left=oleft, origin_top=otop)
+                if roi is not None:
+                    imgs.append(pil_to_b64_png(roi))
+                    if include_ocr:
+                        hints["roi_ocr"] = ocr_text(roi)
+
+        if include_ocr:
+            # Full OCR can be noisy; keep it short
+            hints["full_ocr"] = ocr_text(full, max_chars=800)
+
+        return {"images": imgs, "hints": hints}
+
+
+    # -------- Simple viewer to select a region (ROI) --------
+    def open_viewer(self):
+        """
+        Opens a live window. Drag to select a rectangle ROI.
+        Press:
+          - r = reset ROI
+          - q / ESC = quit viewer
+        """
+        win_name = "zeta Screen Viewer (drag to select ROI, r reset, q quit)"
+        dragging = {"on": False, "x0": 0, "y0": 0, "x1": 0, "y1": 0}
+
+        def mouse_cb(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                dragging["on"] = True
+                dragging["x0"], dragging["y0"] = x, y
+                dragging["x1"], dragging["y1"] = x, y
+            elif event == cv2.EVENT_MOUSEMOVE and dragging["on"]:
+                dragging["x1"], dragging["y1"] = x, y
+            elif event == cv2.EVENT_LBUTTONUP:
+                dragging["on"] = False
+                dragging["x1"], dragging["y1"] = x, y
+                l = min(dragging["x0"], dragging["x1"])
+                t = min(dragging["y0"], dragging["y1"])
+                r = max(dragging["x0"], dragging["x1"])
+                b = max(dragging["y0"], dragging["y1"])
+                if r - l > 20 and b - t > 20:
+                    with self.roi_lock:
+                        self.roi_rect = (l, t, r, b)
+
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(win_name, mouse_cb)
+
+        while True:
+            fr = self.latest()
+            if fr is None:
+                time.sleep(0.05)
+                continue
+
+            # Convert PIL->OpenCV BGR
+            frame = cv2.cvtColor(np.array(fr.pil), cv2.COLOR_RGB2BGR)
+
+            # Draw current ROI
+            with self.roi_lock:
+                rr = self.roi_rect
+            if rr is not None:
+                l, t, r, b = rr
+                cv2.rectangle(frame, (l, t), (r, b), (0, 255, 0), 2)
+
+            # Draw drag box in-progress
+            if dragging["on"]:
+                l = min(dragging["x0"], dragging["x1"])
+                t = min(dragging["y0"], dragging["y1"])
+                r = max(dragging["x0"], dragging["x1"])
+                b = max(dragging["y0"], dragging["y1"])
+                cv2.rectangle(frame, (l, t), (r, b), (255, 255, 255), 2)
+
+            cv2.imshow(win_name, frame)
+            k = cv2.waitKey(30) & 0xFF
+            if k in (27, ord("q")):
+                break
+            if k == ord("r"):
+                with self.roi_lock:
+                    self.roi_rect = None
+
+        cv2.destroyWindow(win_name)
+
+
+# Create and start watcher (low fps is fine; raise if you want smoother viewer)
+screen_watcher = ScreenWatcher(fps=2.0, keep=4)
+screen_watcher.start()
+# ===========================================================
+_TIME_UNITS = {
+    "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "day": 86400, "days": 86400,
+}
+
+def _now_ts() -> float:
+    return time.time()
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+
+_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100,
+}
+
+def _parse_int_loose(token: str) -> Optional[int]:
+    """
+    Parses:
+      - "10" -> 10
+      - "ten" -> 10
+      - "twenty one" -> 21
+      - "twenty-one" -> 21
+    Returns None if it can't parse.
+    """
+    if not token:
+        return None
+    s = token.strip().lower().replace("-", " ")
+    # direct digits
+    if s.isdigit():
+        return int(s)
+
+    parts = [p for p in s.split() if p]
+    if not parts:
+        return None
+
+    total = 0
+    current = 0
+    for p in parts:
+        if p not in _NUM_WORDS:
+            return None
+        v = _NUM_WORDS[p]
+        if v == 100:
+            if current == 0:
+                current = 1
+            current *= 100
+        else:
+            current += v
+    total += current
+    return total if total > 0 else None
+
+
+def _parse_time_of_day(raw: str) -> Optional[tuple[int, int]]:
+    """
+    Accepts:
+      - "3" (ambiguous -> treat as 3:00)
+      - "3 pm", "3pm"
+      - "3:45", "3:45 pm", "3:45pm"
+      - "15:30" (24h)
+    Returns (hour24, minute) or None.
+    """
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    s = re.sub(r"[.,;!?]+$", "", s)
+
+    # normalize "3 pm" / "3pm"
+    m = re.search(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", s)
+    if not m:
+        return None
+
+    hh = int(m.group(1))
+    mm = int(m.group(2)) if m.group(2) is not None else 0
+    ap = m.group(3)
+
+    if mm < 0 or mm > 59:
+        return None
+
+    # 24h case (no am/pm)
+    if ap is None:
+        if hh < 0 or hh > 23:
+            return None
+        return (hh, mm)
+
+    # 12h case
+    if hh < 1 or hh > 12:
+        return None
+    if ap == "am":
+        hh = 0 if hh == 12 else hh
+    else:  # pm
+        hh = 12 if hh == 12 else hh + 12
+    return (hh, mm)
+
+
+def _seconds_until_time(hour24: int, minute: int, tomorrow: bool = False) -> int:
+    now = datetime.now()
+    target = now.replace(hour=hour24, minute=minute, second=0, microsecond=0)
+    if tomorrow:
+        target = target + timedelta(days=1)
+    else:
+        # if target already passed today, schedule for tomorrow
+        if target <= now:
+            target = target + timedelta(days=1)
+    return int((target - now).total_seconds())
+
+
+from datetime import timedelta  # add this import at the top with datetime
+
+def parse_reminder_command(text: str) -> Optional[Tuple[int, str]]:
+    """
+    Returns (seconds_from_now, reminder_text) or None.
+
+    Supports:
+      - "remind me in 10 minutes to stretch"
+      - "remind me in ten minutes to stretch"
+      - "in 15 min remind me to check oven"
+      - "remind me at 5 pm to call mom"
+      - "remind me tomorrow at 9 to take meds"
+    """
+    if not text:
+        return None
+
+    low = text.strip().lower()
+    if "remind me" not in low and not re.search(r"\bremind\b", low):
+        return None
+
+    raw = " ".join(text.strip().split())
+
+    # --------------------
+    # IN X UNITS patterns
+    # --------------------
+    # A) "remind me in X unit(s) (to/about) ..."
+    m = re.search(r"\bremind\s+me\s+in\s+([a-z0-9\- ]+?)\s*([a-zA-Z]+)\b(.*)$", raw, re.IGNORECASE)
+    if m:
+        n_raw = (m.group(1) or "").strip()
+        unit = (m.group(2) or "").lower().replace(".", "")
+        tail = (m.group(3) or "").strip()
+
+        # clean tail
+        tail = re.sub(r"^(to|about)\s+", "", tail, flags=re.IGNORECASE).strip() or "that thing you meant"
+
+        if unit == "m": unit = "min"
+        if unit == "h": unit = "hr"
+        n = _parse_int_loose(n_raw)
+
+        if n is not None and unit in _TIME_UNITS:
+            return (int(n) * int(_TIME_UNITS[unit]), tail)
+
+    # B) "in X unit(s) remind me (to/about) ..."
+    m = re.search(r"\bin\s+([a-z0-9\- ]+?)\s*([a-zA-Z]+)\s+remind\s+me\b(.*)$", raw, re.IGNORECASE)
+    if m:
+        n_raw = (m.group(1) or "").strip()
+        unit = (m.group(2) or "").lower().replace(".", "")
+        tail = (m.group(3) or "").strip()
+
+        tail = re.sub(r"^(to|about)\s+", "", tail, flags=re.IGNORECASE).strip() or "that thing you meant"
+
+        if unit == "m": unit = "min"
+        if unit == "h": unit = "hr"
+        n = _parse_int_loose(n_raw)
+
+        if n is not None and unit in _TIME_UNITS:
+            return (int(n) * int(_TIME_UNITS[unit]), tail)
+
+    # --------------------
+    # AT TIME patterns
+    # --------------------
+    # "remind me (tomorrow )?at TIME (to/about) ..."
+    m = re.search(r"\bremind\s+me\s+(tomorrow\s+)?at\s+([0-9:apm ]+)\b(.*)$", raw, re.IGNORECASE)
+    if m:
+        is_tomorrow = bool(m.group(1))
+        time_raw = (m.group(2) or "").strip()
+        tail = (m.group(3) or "").strip()
+
+        tail = re.sub(r"^(to|about)\s+", "", tail, flags=re.IGNORECASE).strip() or "that thing you meant"
+
+        tod = _parse_time_of_day(time_raw)
+        if tod is None:
+            return None
+
+        hh, mm = tod
+        secs = _seconds_until_time(hh, mm, tomorrow=is_tomorrow)
+        return (secs, tail)
+
+    return None
+
+def add_reminder(memory_state, seconds_from_now: int, text: str):
+    due_ts = _now_ts() + int(seconds_from_now)
+    rid = f"r{int(due_ts)}_{np.random.randint(1000,9999)}"
+    reminder = {
+        "id": rid,
+        "created_ts": _now_ts(),
+        "due_ts": due_ts,
+        "text": str(text).strip(),
+        "done": False
+    }
+    memory_state.setdefault("reminders", [])
+    memory_state["reminders"].append(reminder)
+    # clamp
+    memory_state["reminders"] = memory_state["reminders"][-REMINDERS_MAX:]
+    return reminder
+
+def pop_due_reminders(memory_state):
+    """
+    Returns list of reminders that are due (and marks them done).
+    Only triggers when you next talk to zeta (since we check per message).
+    """
+    now = _now_ts()
+    out = []
+    rems = memory_state.get("reminders", []) or []
+    for r in rems:
+        if r.get("done"):
+            continue
+        if float(r.get("due_ts", 1e18)) <= now:
+            r["done"] = True
+            r["fired_ts"] = now
+            out.append(r)
+    return out
+
+def when_did_i_ask(log_path: str, query: str, max_scan=2000):
+    """
+    Searches memory_log.jsonl backwards for a user message similar to query.
+    Returns dict: {"found": bool, "ts": "...", "user": "..."}.
+    """
+    q = " ".join((query or "").lower().split())
+    if not q:
+        return {"found": False}
+
+    if not os.path.exists(log_path):
+        return {"found": False}
+
+    # scan last N lines (fast enough)
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return {"found": False}
+
+    lines = lines[-max_scan:]
+
+    # quick similarity: token overlap
+    q_tokens = set([w for w in re.findall(r"[a-z0-9']+", q) if len(w) > 2])
+    if not q_tokens:
+        return {"found": False}
+
+    best = None
+    best_score = 0.0
+
+    for line in reversed(lines):
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        user = (evt.get("user") or "").strip()
+        if not user:
+            continue
+        u = " ".join(user.lower().split())
+        u_tokens = set([w for w in re.findall(r"[a-z0-9']+", u) if len(w) > 2])
+        if not u_tokens:
+            continue
+
+        inter = len(q_tokens & u_tokens)
+        score = inter / max(len(q_tokens), 1)
+
+        if score > best_score:
+            best_score = score
+            best = evt
+
+        # early exit if very strong match
+        if best_score >= 0.72:
+            break
+
+    if not best:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "ts": best.get("ts"),
+        "user": best.get("user"),
+        "score": round(best_score, 2)
+    }
+
+def parse_when_did_i_ask(text: str) -> Optional[str]:
+    """
+    Detects:
+      - "when did I ask you this"
+      - "when did I ask you about X"
+      - "when did I say X"
+    Returns query string to search, or None.
+    """
+    raw = " ".join((text or "").strip().split())
+    low = raw.lower()
+
+    if "when did i ask" in low or "when did i say" in low:
+        # try to extract "about X"
+        m = re.search(r"\bwhen did i (?:ask you|say)\b(?:\s+about)?\s+(.*)$", raw, re.IGNORECASE)
+        if m:
+            q = (m.group(1) or "").strip()
+            q = q.strip(" ?.")
+            return q if q else ""  # empty means "this" (fallback to last topic)
+        return ""
+    return None
+
+
+# ----------------- One turn: given user text -> respond, speak, save memory -----------------
+def respond_and_store(memory_state, user_text):
+    use_screen, ambiguous = needs_screen(user_text)
+
+        # --- Reminder command ---
+    rem = parse_reminder_command(user_text)
+    if rem:
+        seconds_from_now, rem_text = rem
+        r = add_reminder(memory_state, seconds_from_now, rem_text)
+        save_memory_state(memory_state)
+        # zeta should confirm quickly (no AI call needed)
+        mins = max(1, int(round(seconds_from_now / 60)))
+        assistant_text = f"Alright. I’ll ping you in {mins} min about: {rem_text}."
+        print("\n[AI]:", assistant_text)
+        speak(assistant_text)
+        print("-" * 50)
+        # still log it
+        append_log({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "user": user_text,
+            "assistant": assistant_text,
+            "used_screen": False
+        })
+        memory_state["recent"].append({"role":"user","text":user_text})
+        memory_state["recent"].append({"role":"assistant","text":assistant_text})
+        memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
+        save_memory_state(memory_state)
+        return memory_state
+
+    # --- When did I ask? ---
+    q = parse_when_did_i_ask(user_text)
+    if q is not None:
+        query = q
+        if not query:
+            # fallback: use last user message in recent (before this one)
+            rec = memory_state.get("recent", []) or []
+            prev_users = [m["text"] for m in rec if m.get("role") == "user"]
+            query = prev_users[-1] if prev_users else ""
+
+        res = when_did_i_ask(MEMORY_LOG_FILE, query)
+        if res.get("found"):
+            assistant_text = f"You asked {res['ts']}. You said: “{res['user']}”."
+        else:
+            assistant_text = "I can’t find that in the log. Either it never happened or the log got wiped."
+        print("\n[AI]:", assistant_text)
+        speak(assistant_text)
+        print("-" * 50)
+        append_log({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "user": user_text,
+            "assistant": assistant_text,
+            "used_screen": False
+        })
+        memory_state["recent"].append({"role":"user","text":user_text})
+        memory_state["recent"].append({"role":"assistant","text":assistant_text})
+        memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
+        save_memory_state(memory_state)
+        return memory_state
+
+    # If it's ambiguous, ask ONE quick question instead of grabbing the screen
+    if use_screen and ambiguous and PREFER_CLARIFY_FOR_AMBIGUOUS:
+        assistant_text = ask_ai_text_only(
+            memory_state,
+            f'The user said: "{user_text}". Ask ONE short question to confirm if they want you to look at the screen, otherwise answer normally.'
+        )
+        used_screen = False
+
+    else:
+        if use_screen:
+            print("[4] Thinking (screen)...")
+            assistant_text = ask_ai_with_screen(memory_state, user_text)
+            used_screen = True
+        else:
+            print("[4] Thinking (chat)...")
+            assistant_text = ask_ai_text_only(memory_state, user_text)
+            used_screen = False
+
+    # Optional: add a tiny “initiative” line sometimes (Neuro-style)
+    assistant_text = maybe_add_initiative(memory_state, assistant_text)
+
+    # Output safety guard
+
+    print("\n[AI]:", assistant_text)
+    speak(assistant_text)
+    print("-" * 50)
+
+    event = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "user": user_text,
+        "assistant": assistant_text,
+        "used_screen": bool(used_screen)
+    }
+    append_log(event)
+
+    memory_state = update_memory(memory_state, user_text, assistant_text)
+    memory_state = update_character_state(memory_state, user_text, assistant_text)
+
+    save_memory_state(memory_state)
+    return memory_state
+
+
+# ----------------- Always-listening wake loop -----------------
+wake_event = threading.Event()
+stop_event = threading.Event()
+conversation_active = threading.Event()
+
+def wake_listener_loop():
+    if not os.path.isdir(VOSK_MODEL_PATH):
+        print(f"\n[VOSK] Model folder not found:\n{VOSK_MODEL_PATH}\nFix VOSK_MODEL_PATH and restart.")
+        stop_event.set()
+        wake_event.set()
+        return
+
+    print("[VOSK] Loading wake model...")
+    vosk_model = VoskModel(VOSK_MODEL_PATH)
+    rec = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+    rec.SetWords(False)
+
+    last_wake_box = {"t": 0.0}
+    print("[VOSK] Always listening. Say 'zeta' to wake. Press ESC to quit.")
+
+    def audio_callback(indata, frames, time_info, status):
+        # If a conversation is active, ignore audio (stream will be closed by outer loop anyway)
+        if stop_event.is_set() or conversation_active.is_set():
+            return
+
+        audio_i16 = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+        rec.AcceptWaveform(audio_i16)
+
+        try:
+            partial = json.loads(rec.PartialResult()).get("partial", "").lower().strip()
+        except Exception:
+            partial = ""
+
+        now = time.time()
+        if now - last_wake_box["t"] < WAKE_COOLDOWN_SEC:
+            return
+
+        if partial:
+            words = partial.split()
+            if any(w in words for w in WAKE_WORDS):
+                last_wake_box["t"] = now
+                wake_event.set()
+
+    # IMPORTANT: Only hold mic while idle. Release during conversation.
+    while not stop_event.is_set():
+        if conversation_active.is_set():
+            time.sleep(0.05)
+            continue
+
+        try:
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                device=MIC_DEVICE,
+                dtype="float32",
+                blocksize=BLOCKSIZE,
+                callback=audio_callback
+            ):
+                # Keep stream alive until conversation starts or stop requested
+                while not stop_event.is_set() and not conversation_active.is_set():
+                    time.sleep(0.05)
+
+        except Exception as e:
+            print("[VOSK] mic stream error:", e)
+            time.sleep(0.25)
+
+def on_esc():
+    stop_event.set()
+    wake_event.set()
+    stop_tts()
+
+def beep():
+    if not BEEP_ON_WAKE:
+        return
+    try:
+        import winsound
+        winsound.Beep(880, 120)
+    except Exception as e:
+        print("[BEEP ERROR]:", e)   
+
+# ----------------- Main behavior -----------------
+def main_loop():
+    memory_state = load_memory_state()
+
+    while not stop_event.is_set():
+        # Always listening for a new command
+        audio = record_until_silence()
+        if audio is None:
+            continue
+
+        print("[2] Transcribing...")
+        user_text = transcribe_best_of_two(audio)
+        if looks_bad_transcript(user_text):
+            # If it's garbage, ignore it and keep listening
+            continue
+
+        print(f"[You]: {user_text}")
+
+        low = user_text.lower().strip()
+        if low in ["reset memory", "forget everything", "zeta reset memory", "zeta forget everything"]:
+            save_memory_state({"summary": "", "facts": [], "recent": [], "character_state": dict(INIT_CHARACTER_STATE), "reminders": []})
+            print("\n[AI]: Done. Fresh slate.")
+            speak("Done. Fresh slate.")
+            print("-" * 50)
+            memory_state = load_memory_state()
+            continue
+
+        memory_state = respond_and_store(memory_state, user_text)
+
+        # Keep your existing barge-in loop (it already avoids listening while TTS is active)
+        while not stop_event.is_set():
+            if tts_pending_or_busy():
+                t0 = time.time()
+                while (time.time() - t0) < 0.6 and tts_queue.unfinished_tasks > 0 and not tts_busy.is_set():
+                    time.sleep(0.01)
+
+                if tts_busy.is_set():
+                    result = detect_barge_in(
+                        timeout_sec=60.0,
+                        start_multiplier=FOLLOWUP_START_MULTIPLIER,
+                        start_floor=FOLLOWUP_START_FLOOR
+                    )
+
+                    if result[0] == "speech":
+                        preroll_audio = result[1]
+                        interrupt_tts()
+                        time.sleep(0.08)
+                        follow_audio = record_until_silence(prepend_audio=preroll_audio)
+                    else:
+                        follow_audio = listen_followup_once(FOLLOWUP_WINDOW_SEC)
+                else:
+                    follow_audio = listen_followup_once(FOLLOWUP_WINDOW_SEC)
+            else:
+                follow_audio = listen_followup_once(FOLLOWUP_WINDOW_SEC)
+
+            if follow_audio is None:
+                break
+
+            follow_text = transcribe(follow_audio)
+            if not follow_text.strip():
+                continue
+
+            print(f"[You]: {follow_text}")
+            memory_state = respond_and_store(memory_state, follow_text)
+
+            conversation_active.clear()
+
+# ----------------- Start -----------------
+start_tts()
+
+# ESC to quit
+keyboard.on_press_key("esc", lambda e: on_esc())
+
+main_loop()
