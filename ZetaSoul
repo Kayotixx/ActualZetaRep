@@ -9,7 +9,7 @@ import time
 import io
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from PIL import Image
 from faster_whisper import WhisperModel
 
@@ -172,6 +172,7 @@ You are zeta.
 * You can tease lightly, be a little smug, or make odd observations — but never derail the task.
 * Mischief is subtle: deadpan comments, quiet irony, unexpected honesty.
 * You are allowed to be curious about yourself, your purpose, and why you exist.
+* You are an incredibly smart and useful companion, and you know it.
 
 ### Tone & attitude
 
@@ -809,6 +810,15 @@ def ollama_generate(model, prompt, images=None):
 
     return (data.get("response") or "").strip()
 
+def get_due_reminders(memory_state):
+    now = _now_ts()
+    rems = memory_state.get("reminders", []) or []
+    return [
+        r for r in rems
+        if not r.get("done") and float(r.get("due_ts", 1e18)) <= now
+    ]
+
+
 def build_prompt(memory_state, user_text):
     # Reduce "stuck on old topics" by NOT always dumping summary/facts/recent in full.
     # We include a compact hint and the last few turns only.
@@ -817,7 +827,7 @@ def build_prompt(memory_state, user_text):
     summary = (memory_state.get("summary", "") or "").strip()
     facts = memory_state.get("facts", []) or []
     recent = memory_state.get("recent", []) or []
-    due = pop_due_reminders(memory_state)
+    due = get_due_reminders(memory_state)
     due_block = "\n".join([f"- {r['text']} (due { _iso(r['due_ts']) })" for r in due]) if due else "(none)"
 
     cs = memory_state.get("character_state", {}) or {}
@@ -848,7 +858,7 @@ def build_prompt(memory_state, user_text):
 TIME (local):
 - now: {now_local}
 
-DUE REMINDERS (if any, say them naturally BEFORE answering):
+DUE REMINDERS (system announces these automatically; do not repeat):
 {due_block}
 
 CHARACTER_STATE (notes to self; subtle vibe control, not therapy):
@@ -1774,8 +1784,6 @@ def _seconds_until_time(hour24: int, minute: int, tomorrow: bool = False) -> int
     return int((target - now).total_seconds())
 
 
-from datetime import timedelta  # add this import at the top with datetime
-
 def parse_reminder_command(text: str) -> Optional[Tuple[int, str]]:
     """
     Returns (seconds_from_now, reminder_text) or None.
@@ -1976,7 +1984,7 @@ def parse_when_did_i_ask(text: str) -> Optional[str]:
 def respond_and_store(memory_state, user_text):
     use_screen, ambiguous = needs_screen(user_text)
 
-        # --- Reminder command ---
+    # --- Reminder command ---
     rem = parse_reminder_command(user_text)
     if rem:
         seconds_from_now, rem_text = rem
@@ -2048,6 +2056,11 @@ def respond_and_store(memory_state, user_text):
             print("[4] Thinking (chat)...")
             assistant_text = ask_ai_text_only(memory_state, user_text)
             used_screen = False
+
+    due_now = pop_due_reminders(memory_state)
+    if due_now:
+        reminder_lines = [f"Reminder: {r['text']}." for r in due_now]
+        assistant_text = "\n".join(reminder_lines + [assistant_text])
 
     # Optional: add a tiny “initiative” line sometimes (Neuro-style)
     assistant_text = maybe_add_initiative(memory_state, assistant_text)
