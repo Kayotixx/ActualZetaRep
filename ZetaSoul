@@ -9,8 +9,11 @@ import time
 import io
 import json
 import os
-from datetime import datetime
-from PIL import Image
+import platform
+import subprocess
+import traceback
+from datetime import datetime, timedelta
+from PIL import Image, ImageFilter
 from faster_whisper import WhisperModel
 
 import pyttsx3
@@ -39,6 +42,7 @@ COMMAND_CONFIRM_SEC = 0.16
 
 # ----------------- Vosk for barge-in (speech confirm) -----------------
 barge_vosk_model = None
+last_barge_ts = 0.0
 
 def get_barge_vosk_model():
     global barge_vosk_model
@@ -104,6 +108,12 @@ BARGE_PREROLL_SEC = 0.6
 
 STOP_THRESHOLD_RATIO = 0.75
 
+MAX_RECORD_SEC = 12.0
+MAX_FOLLOWUP_SEC = 20.0
+MAX_SCREENSHOT_AGE_SEC = 2.0
+
+BARGE_INTERRUPT_COOLDOWN_SEC = 0.6
+
 # IMPORTANT: make this match SILENCE_TIME
 SILENT_BLOCKS_REQUIRED = int((SILENCE_TIME * SAMPLE_RATE) / BLOCKSIZE)
 
@@ -122,6 +132,18 @@ ENABLE_TTS = True
 TTS_RATE = 175
 TTS_VOLUME = 1.0
 TTS_VOICE_HINT = "David"
+
+TURN_METRICS_FILE = "turn_metrics.jsonl"
+
+ALLOW_SCREEN_CAPTURE = True
+ENABLE_SCREEN_REDACTION = True
+
+ROUTER_MODEL = CHAT_MODEL
+FALLBACK_CHAT_MODEL = CHAT_MODEL
+
+NOTES_FILE = "notes.jsonl"
+TIMERS_STATE_KEY = "timers"
+NOTES_STATE_KEY = "notes"
 
 # --- Neuro-style character growth ---
 INIT_CHARACTER_STATE = {
@@ -172,6 +194,7 @@ You are zeta.
 * You can tease lightly, be a little smug, or make odd observations — but never derail the task.
 * Mischief is subtle: deadpan comments, quiet irony, unexpected honesty.
 * You are allowed to be curious about yourself, your purpose, and why you exist.
+* You are an incredibly smart and useful companion, and you know it.
 
 ### Tone & attitude
 
@@ -286,6 +309,43 @@ tts_stop_flag = threading.Event()
 tts_engine_lock = threading.Lock()
 tts_current_engine = None
 
+metrics_lock = threading.Lock()
+active_turn_metrics = None
+
+
+def set_active_metrics(metrics):
+    global active_turn_metrics
+    with metrics_lock:
+        active_turn_metrics = metrics
+
+
+def get_active_metrics():
+    with metrics_lock:
+        return active_turn_metrics
+
+
+def log_turn_metrics(metrics):
+    if not metrics:
+        return
+    with open(TURN_METRICS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+
+    asr = metrics.get("asr_sec")
+    llm = metrics.get("llm_sec")
+    tts = metrics.get("tts_sec")
+    total = metrics.get("total_sec")
+    parts = []
+    if asr is not None:
+        parts.append(f"ASR {asr:.2f}s")
+    if llm is not None:
+        parts.append(f"LLM {llm:.2f}s")
+    if tts is not None:
+        parts.append(f"TTS {tts:.2f}s")
+    if total is not None:
+        parts.append(f"Total {total:.2f}s")
+    if parts:
+        print(" | ".join(parts))
+
 
 def _chunk_text_for_tts(text: str, max_chars: int = 140):
     """
@@ -375,6 +435,10 @@ def tts_worker():
             tts_stop_flag.clear()  # reset for this utterance
             print("[TTS] Speaking:", text[:120])
 
+            metrics = get_active_metrics()
+            if metrics is not None and metrics.get("tts_start_ts") is None:
+                metrics["tts_start_ts"] = time.time()
+
             _sapi_speak_blocking(text)
 
         except Exception as e:
@@ -383,6 +447,15 @@ def tts_worker():
         finally:
             tts_busy.clear()
             tts_queue.task_done()
+            metrics = get_active_metrics()
+            if metrics is not None and tts_queue.unfinished_tasks == 0:
+                metrics["tts_end_ts"] = time.time()
+                if metrics.get("record_start_ts") and metrics.get("tts_end_ts"):
+                    metrics["total_sec"] = metrics["tts_end_ts"] - metrics["record_start_ts"]
+                if metrics.get("tts_start_ts") and metrics.get("tts_end_ts"):
+                    metrics["tts_sec"] = metrics["tts_end_ts"] - metrics["tts_start_ts"]
+                log_turn_metrics(metrics)
+                set_active_metrics(None)
 
 
 def start_tts():
@@ -427,6 +500,7 @@ def speak(text: str):
     if not text or not text.strip():
         return
 
+    set_assistant_state("SPEAKING")
     start_tts()
     clean = " ".join(text.split())
     tts_queue.put(clean)
@@ -649,8 +723,15 @@ def detect_barge_in(timeout_sec=10.0, start_multiplier=3.0, start_floor=0.0020):
             # If we have tangible speech for long enough, trigger barge-in
             if tangible_hit and speech_started_at is not None:
                 if (time.time() - speech_started_at) >= BARGE_CONFIRM_SEC:
-                    pre = np.concatenate(list(preroll), axis=0).reshape(-1).astype(np.float32)
-                    return ("speech", pre)
+                    global last_barge_ts
+                    now_ts = time.time()
+                    if (now_ts - last_barge_ts) < BARGE_INTERRUPT_COOLDOWN_SEC:
+                        speech_started_at = None
+                        tangible_hit = False
+                    else:
+                        last_barge_ts = now_ts
+                        pre = np.concatenate(list(preroll), axis=0).reshape(-1).astype(np.float32)
+                        return ("speech", pre)
 
             if (time.time() - start) >= timeout_sec:
                 return ("timeout", None)
@@ -672,6 +753,22 @@ def load_memory_state():
                 # ensure reminders exists (time perception feature)
                 if "reminders" not in state or not isinstance(state.get("reminders"), list):
                     state["reminders"] = []
+                if "profile" not in state or not isinstance(state.get("profile"), dict):
+                    state["profile"] = {}
+                if "preferences" not in state or not isinstance(state.get("preferences"), dict):
+                    state["preferences"] = {}
+                if "projects" not in state or not isinstance(state.get("projects"), list):
+                    state["projects"] = []
+                if "systems" not in state or not isinstance(state.get("systems"), dict):
+                    state["systems"] = {}
+                if "people" not in state or not isinstance(state.get("people"), list):
+                    state["people"] = []
+                if "memory_enabled" not in state:
+                    state["memory_enabled"] = True
+                if "screen_capture_enabled" not in state:
+                    state["screen_capture_enabled"] = ALLOW_SCREEN_CAPTURE
+                if TIMERS_STATE_KEY not in state or not isinstance(state.get(TIMERS_STATE_KEY), list):
+                    state[TIMERS_STATE_KEY] = []
 
                 return state
         except Exception:
@@ -683,7 +780,15 @@ def load_memory_state():
         "facts": [],
         "recent": [],
         "character_state": dict(INIT_CHARACTER_STATE),
-        "reminders": []  # <-- new
+        "reminders": [],
+        "profile": {},
+        "preferences": {},
+        "projects": [],
+        "systems": {},
+        "people": [],
+        "memory_enabled": True,
+        "screen_capture_enabled": ALLOW_SCREEN_CAPTURE,
+        TIMERS_STATE_KEY: [],
     }
 
 
@@ -694,6 +799,11 @@ def save_memory_state(state):
 def append_log(event):
     with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def log_exception(context: str):
+    print(f"[ERROR] {context}")
+    traceback.print_exc()
 
 def clamp_list(lst, max_len):
     return lst if len(lst) <= max_len else lst[-max_len:]
@@ -707,6 +817,59 @@ def dedupe_facts(facts):
             seen.add(key)
             out.append(fact)
     return out[:MAX_FACTS]
+
+
+def _tokenize(text: str) -> set:
+    return set([w for w in re.findall(r"[a-z0-9']+", (text or "").lower()) if len(w) > 2])
+
+
+def _memory_items(memory_state):
+    items = []
+    profile = memory_state.get("profile", {}) or {}
+    preferences = memory_state.get("preferences", {}) or {}
+    systems = memory_state.get("systems", {}) or {}
+    projects = memory_state.get("projects", []) or []
+    people = memory_state.get("people", []) or []
+
+    for k, v in profile.items():
+        items.append({"category": "profile", "text": f"{k}: {v}"})
+    for k, v in preferences.items():
+        items.append({"category": "preferences", "text": f"{k}: {v}"})
+    for k, v in systems.items():
+        items.append({"category": "systems", "text": f"{k}: {v}"})
+    for p in projects:
+        if isinstance(p, dict):
+            text = f"{p.get('name','')}: {p.get('goal','')}; {p.get('status','')}; {p.get('notes','')}"
+        else:
+            text = str(p)
+        items.append({"category": "projects", "text": text})
+    for person in people:
+        if isinstance(person, dict):
+            text = f"{person.get('name','')}: {person.get('relationship','')}; {person.get('notes','')}"
+        else:
+            text = str(person)
+        items.append({"category": "people", "text": text})
+
+    for fact in memory_state.get("facts", []) or []:
+        items.append({"category": "facts", "text": fact})
+
+    return items
+
+
+def retrieve_memory(user_text: str, memory_state, limit: int = 6):
+    q_tokens = _tokenize(user_text)
+    if not q_tokens:
+        return []
+    scored = []
+    for item in _memory_items(memory_state):
+        t_tokens = _tokenize(item.get("text", ""))
+        if not t_tokens:
+            continue
+        score = len(q_tokens & t_tokens) / max(len(t_tokens), 1)
+        if score > 0:
+            scored.append((score, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in scored[:limit]]
 
 # ----------------- Screen gating -----------------
 def needs_screen(user_text: str):
@@ -788,7 +951,7 @@ def ollama_generate(model, prompt, images=None):
     payload = {
         "model": model,
         "prompt": prompt,
-        "stream": False,
+        "stream": True,
         "options": {
             "num_predict": 256,     # increase if you want longer replies (e.g., 512)
             "temperature": 0.7,
@@ -799,17 +962,119 @@ def ollama_generate(model, prompt, images=None):
     if images:
         payload["images"] = images
 
-    r = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    r = requests.post(OLLAMA_URL, json=payload, timeout=300, stream=True)
     r.raise_for_status()
-    data = r.json()
+    parts = []
+    for line in r.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        data = json.loads(line)
+        chunk = data.get("response") or ""
+        if chunk:
+            parts.append(chunk)
+        if data.get("done"):
+            if "done_reason" in data:
+                print("[OLLAMA] done_reason:", data["done_reason"])
+            break
 
-    # Some Ollama builds include "done_reason"
-    if "done_reason" in data:
-        print("[OLLAMA] done_reason:", data["done_reason"])
+    return ("".join(parts)).strip()
 
-    return (data.get("response") or "").strip()
 
-def build_prompt(memory_state, user_text):
+def ollama_generate_stream(model, prompt, images=None):
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": True,
+        "options": {
+            "num_predict": 256,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1
+        }
+    }
+    if images:
+        payload["images"] = images
+
+    r = requests.post(OLLAMA_URL, json=payload, timeout=300, stream=True)
+    r.raise_for_status()
+    for line in r.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        data = json.loads(line)
+        chunk = data.get("response") or ""
+        if chunk:
+            yield chunk
+        if data.get("done"):
+            if "done_reason" in data:
+                print("[OLLAMA] done_reason:", data["done_reason"])
+            break
+
+def get_due_reminders(memory_state):
+    now = _now_ts()
+    rems = memory_state.get("reminders", []) or []
+    return [
+        r for r in rems
+        if not r.get("done") and float(r.get("due_ts", 1e18)) <= now
+    ]
+
+
+def route_intent(user_text: str):
+    low = (user_text or "").lower()
+    intent = "chat"
+    need_screen = False
+    clarify_question = ""
+    actions = []
+    response_mode = ""
+
+    if parse_reminder_command(user_text):
+        intent = "reminder"
+        actions.append("ADD_REMINDER")
+    if parse_reminder_control(user_text):
+        intent = "reminder"
+        actions.append("REMINDER_CONTROL")
+    timer_cmd = parse_timer_command(user_text)
+    if timer_cmd:
+        intent = "timer"
+        actions.append(timer_cmd["action"])
+    note_cmd = parse_note_command(user_text)
+    if note_cmd:
+        intent = "note"
+        actions.append("NOTE")
+    mem_cmd = parse_memory_command(user_text)
+    if mem_cmd:
+        intent = "memory"
+        actions.append(mem_cmd["action"])
+    clip_cmd = parse_clipboard_command(user_text)
+    if clip_cmd:
+        intent = "clipboard"
+        actions.append("CLIPBOARD")
+
+    use_screen, ambiguous = needs_screen(user_text)
+    need_screen = bool(use_screen)
+    if need_screen and ambiguous:
+        clarify_question = "Want me to look at the screen for this?"
+
+    if "steps" in low:
+        response_mode = "steps"
+    elif "debug" in low:
+        response_mode = "debug checklist"
+    elif "eli5" in low or "explain like i'm 5" in low:
+        response_mode = "explain like I'm 5"
+    elif "just code" in low:
+        response_mode = "just code"
+    elif "short" in low or "quick" in low:
+        response_mode = "quick answer"
+
+    return {
+        "intent": intent,
+        "need_screen": need_screen,
+        "clarify_question": clarify_question,
+        "actions": actions,
+        "response_mode": response_mode,
+    }
+
+
+def build_prompt(memory_state, user_text, response_mode: str = ""):
     # Reduce "stuck on old topics" by NOT always dumping summary/facts/recent in full.
     # We include a compact hint and the last few turns only.
     now_local = datetime.now().isoformat(timespec="seconds")
@@ -817,7 +1082,7 @@ def build_prompt(memory_state, user_text):
     summary = (memory_state.get("summary", "") or "").strip()
     facts = memory_state.get("facts", []) or []
     recent = memory_state.get("recent", []) or []
-    due = pop_due_reminders(memory_state)
+    due = get_due_reminders(memory_state)
     due_block = "\n".join([f"- {r['text']} (due { _iso(r['due_ts']) })" for r in due]) if due else "(none)"
 
     cs = memory_state.get("character_state", {}) or {}
@@ -836,19 +1101,25 @@ def build_prompt(memory_state, user_text):
     # Keep only the last 6 messages (3 turns)
     recent = recent[-6:]
 
+    relevant = retrieve_memory(user_text, memory_state, limit=8)
+    relevant_block = "\n".join([f"- [{i['category']}] {i['text']}" for i in relevant]) if relevant else "(none)"
+
     # Keep facts short (top N)
-    facts = facts[:20]
+    facts = facts[:10]
 
     facts_block = "\n".join(f"- {f}" for f in facts) if facts else "(none)"
     recent_block = "\n".join(f"{m['role'].upper()}: {m['text']}" for m in recent) if recent else "(none)"
+
+    mode_line = f"- mode: {response_mode}" if response_mode else "- mode: (default)"
 
     return f"""
 {ASSISTANT_PERSONA}
 
 TIME (local):
 - now: {now_local}
+{mode_line}
 
-DUE REMINDERS (if any, say them naturally BEFORE answering):
+DUE REMINDERS (system announces these automatically; do not repeat):
 {due_block}
 
 CHARACTER_STATE (notes to self; subtle vibe control, not therapy):
@@ -856,11 +1127,20 @@ CHARACTER_STATE (notes to self; subtle vibe control, not therapy):
 
 Memory (only use if it genuinely helps; don't get preachy):
 - Context summary: {summary if summary else "(empty)"}
-- Useful facts:
+- Relevant memory:
+{relevant_block}
+- Legacy facts (fallback):
 {facts_block}
 
 Recent chat (last few lines):
 {recent_block}
+
+Response formatting rules:
+- If mode is "steps": respond with a numbered list.
+- If mode is "debug checklist": respond with a checklist of diagnostic steps.
+- If mode is "quick answer": keep it short (1-3 sentences).
+- If mode is "explain like I'm 5": simple words, short sentences.
+- If mode is "just code": output only code, no commentary.
 
 USER:
 {user_text}
@@ -869,11 +1149,11 @@ zeta:
 """.strip()
 
 
-def ask_ai_text_only(memory_state, user_text):
-    prompt = build_prompt(memory_state, user_text)
+def ask_ai_text_only(memory_state, user_text, response_mode: str = ""):
+    prompt = build_prompt(memory_state, user_text, response_mode=response_mode)
     return ollama_generate(CHAT_MODEL, prompt)
 
-def ask_ai_with_screen(memory_state, user_text):
+def ask_ai_with_screen(memory_state, user_text, response_mode: str = ""):
     bundle = screen_watcher.snapshot_bundle_base64(
         include_active_window=True,
         include_roi=True,
@@ -893,24 +1173,103 @@ Order:
 Use the crops first if text is tiny.
 OCR hints are optional—trust the image more.
 
+Screen help format:
+- Identify app/window
+- Read the error/message
+- Cause (short)
+- Fix steps (numbered, specific)
+- Verification (how to confirm)
+
 Reply like yourself (casual, dry, helpful). No narrating.
 If you're unsure, ask ONE short question.
 OCR_HINTS:
 {json.dumps(hints, ensure_ascii=False)}
 """.strip()
 
-    prompt = build_prompt(memory_state, user_text) + "\n\n" + screen_instruction
+    prompt = build_prompt(memory_state, user_text, response_mode=response_mode) + "\n\n" + screen_instruction
     return ollama_generate(VISION_MODEL, prompt, images=images)
+
+
+def build_screen_prompt(memory_state, user_text, response_mode: str = "", include_roi=True, include_ocr=True):
+    bundle = screen_watcher.snapshot_bundle_base64(
+        include_active_window=True,
+        include_roi=include_roi,
+        include_ocr=include_ocr
+    )
+    images = bundle["images"]
+    hints = bundle["hints"]
+
+    screen_instruction = f"""
+ZETA NOTE:
+You can see screenshots in this message.
+Order:
+1) Full desktop
+2) Active window crop (if present)
+3) ROI crop (if present)
+
+Use the crops first if text is tiny.
+OCR hints are optional—trust the image more.
+
+Screen help format:
+- Identify app/window
+- Read the error/message
+- Cause (short)
+- Fix steps (numbered, specific)
+- Verification (how to confirm)
+
+Reply like yourself (casual, dry, helpful). No narrating.
+If you're unsure, ask ONE short question.
+OCR_HINTS:
+{json.dumps(hints, ensure_ascii=False)}
+""".strip()
+
+    prompt = build_prompt(memory_state, user_text, response_mode=response_mode) + "\n\n" + screen_instruction
+    return prompt, images
+
+
+def stream_reply_with_tts(model, prompt, images=None):
+    buffer = ""
+    full = []
+
+    def flush_sentence(text):
+        clean = text.strip()
+        if clean:
+            speak(clean)
+
+    for chunk in ollama_generate_stream(model, prompt, images=images):
+        full.append(chunk)
+        buffer += chunk
+        while True:
+            m = re.search(r"([.!?]\s)", buffer)
+            if not m:
+                break
+            end = m.end(1)
+            sentence = buffer[:end]
+            buffer = buffer[end:]
+            flush_sentence(sentence)
+
+    if buffer.strip():
+        flush_sentence(buffer)
+
+    return ("".join(full)).strip()
 
 
 # ----------------- Memory update -----------------
 def update_memory(memory_state, user_text, assistant_text):
+    if not memory_state.get("memory_enabled", True):
+        return memory_state
+
     memory_state["recent"].append({"role": "user", "text": user_text})
     memory_state["recent"].append({"role": "assistant", "text": assistant_text})
     memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
 
     current_summary = (memory_state.get("summary", "") or "").strip()
     current_facts = memory_state.get("facts", []) or []
+    current_profile = memory_state.get("profile", {}) or {}
+    current_preferences = memory_state.get("preferences", {}) or {}
+    current_projects = memory_state.get("projects", []) or []
+    current_systems = memory_state.get("systems", {}) or {}
+    current_people = memory_state.get("people", []) or []
 
     extractor_prompt = f"""
 You are updating memory for zeta.
@@ -929,6 +1288,21 @@ CURRENT CONTEXT (optional):
 CURRENT FACTS/PREFERENCES:
 {json.dumps(current_facts, ensure_ascii=False)}
 
+CURRENT PROFILE:
+{json.dumps(current_profile, ensure_ascii=False)}
+
+CURRENT PREFERENCES:
+{json.dumps(current_preferences, ensure_ascii=False)}
+
+CURRENT PROJECTS:
+{json.dumps(current_projects, ensure_ascii=False)}
+
+CURRENT SYSTEMS:
+{json.dumps(current_systems, ensure_ascii=False)}
+
+CURRENT PEOPLE:
+{json.dumps(current_people, ensure_ascii=False)}
+
 NEW DIALOGUE:
 USER: {user_text}
 zeta: {assistant_text}
@@ -940,11 +1314,17 @@ Tasks:
    - Keep facts short and practical.
    - Ignore one-off topics, random task names, or temporary troubleshooting steps unless the user says to remember them.
 3) Do not store “conversation steering” preferences unless the user explicitly states them as a preference.
+4) If there are changes to profile/preferences/projects/systems/people, include them.
 
 Return STRICT JSON:
 {{
   "summary": "",
-  "new_facts": []
+  "new_facts": [],
+  "profile": {{}},
+  "preferences": {{}},
+  "projects": [],
+  "systems": {{}},
+  "people": []
 }}
 """.strip()
 
@@ -964,12 +1344,34 @@ Return STRICT JSON:
         nf = data.get("new_facts", [])
         if isinstance(nf, list):
             new_facts = [x.strip() for x in nf if isinstance(x, str) and x.strip()]
+
+        profile = data.get("profile", {})
+        if isinstance(profile, dict):
+            current_profile.update({k: v for k, v in profile.items() if k and v})
+        prefs = data.get("preferences", {})
+        if isinstance(prefs, dict):
+            current_preferences.update({k: v for k, v in prefs.items() if k and v})
+        systems = data.get("systems", {})
+        if isinstance(systems, dict):
+            current_systems.update({k: v for k, v in systems.items() if k and v})
+
+        projects = data.get("projects", [])
+        if isinstance(projects, list):
+            current_projects.extend([p for p in projects if p])
+        people = data.get("people", [])
+        if isinstance(people, list):
+            current_people.extend([p for p in people if p])
     except Exception:
         pass
 
     merged = current_facts + new_facts
     memory_state["facts"] = dedupe_facts(merged)
     memory_state["summary"] = new_summary
+    memory_state["profile"] = current_profile
+    memory_state["preferences"] = current_preferences
+    memory_state["projects"] = current_projects[-20:]
+    memory_state["systems"] = current_systems
+    memory_state["people"] = current_people[-20:]
     return memory_state
 
 
@@ -1158,7 +1560,7 @@ COMMAND_PREROLL_SEC = 1.2
 COMMAND_START_MULTIPLIER = 2.8
 COMMAND_START_FLOOR = 0.0022
 
-def record_until_silence(prepend_audio: np.ndarray | None = None):
+def record_until_silence(prepend_audio: np.ndarray | None = None, metrics=None):
     print(f"Listening... (min {MIN_RECORD_TIME:.1f}s)")
 
     audio_chunks = []
@@ -1166,6 +1568,8 @@ def record_until_silence(prepend_audio: np.ndarray | None = None):
         audio_chunks.append(prepend_audio.reshape(-1, 1).astype(np.float32))
 
     start_time = time.time()
+    if isinstance(metrics, dict):
+        metrics["record_start_ts"] = start_time
 
     # preroll buffer
     max_blocks = int((COMMAND_PREROLL_SEC * SAMPLE_RATE) / BLOCKSIZE) + 2
@@ -1292,12 +1696,18 @@ def record_until_silence(prepend_audio: np.ndarray | None = None):
             time.sleep(0.03)
 
             # IMPORTANT: no timeout anymore => always listening
+            if (time.time() - start_time) >= MAX_RECORD_SEC:
+                print("[Record] Max record time reached.")
+                break
+
             if recording and silent_blocks >= SILENT_BLOCKS_REQUIRED:
                 break
 
     audio = np.concatenate(audio_chunks, axis=0).reshape(-1).astype(np.float32)
     if float(np.max(np.abs(audio))) < 0.01:
         return None
+    if isinstance(metrics, dict):
+        metrics["record_end_ts"] = time.time()
     return audio
 
 
@@ -1383,7 +1793,7 @@ def listen_followup_once(timeout_sec: float):
         while True:
             time.sleep(0.05)
 
-            if not recording and (time.time() - start) > timeout_sec:
+            if not recording and (time.time() - start) > min(timeout_sec, MAX_FOLLOWUP_SEC):
                 print("[Follow-up] No follow-up detected. Going back to wake word.")
                 return None
 
@@ -1427,6 +1837,22 @@ def grab_desktop_pil_with_origin():
         grab = sct.grab(mon)
         im = Image.frombytes("RGB", grab.size, grab.rgb)
         return im, int(mon["left"]), int(mon["top"])
+
+
+def redact_screen_image(im: Image.Image) -> Image.Image:
+    if not ENABLE_SCREEN_REDACTION:
+        return im
+    w, h = im.size
+    redacted = im.copy()
+    top_h = min(90, h)
+    bottom_h = min(90, h)
+    if top_h > 0:
+        top = redacted.crop((0, 0, w, top_h)).filter(ImageFilter.GaussianBlur(radius=8))
+        redacted.paste(top, (0, 0))
+    if bottom_h > 0:
+        bottom = redacted.crop((0, h - bottom_h, w, h)).filter(ImageFilter.GaussianBlur(radius=8))
+        redacted.paste(bottom, (0, h - bottom_h))
+    return redacted
 
 
 def get_active_window_rect():
@@ -1524,6 +1950,7 @@ class ScreenWatcher:
         while not self.stop_flag.is_set():
             try:
                 im, oleft, otop = grab_desktop_pil_with_origin()
+                im = redact_screen_image(im)
                 fr = ScreenFrame(pil=im, ts=time.time(), origin_left=oleft, origin_top=otop)
                 with self.lock:
                     self.frames.append(fr)
@@ -1550,6 +1977,8 @@ class ScreenWatcher:
         """
         fr = self.latest()
         if fr is None:
+            return {"images": [], "hints": {}}
+        if (time.time() - fr.ts) > MAX_SCREENSHOT_AGE_SEC:
             return {"images": [], "hints": {}}
 
         full = fr.pil
@@ -1774,8 +2203,6 @@ def _seconds_until_time(hour24: int, minute: int, tomorrow: bool = False) -> int
     return int((target - now).total_seconds())
 
 
-from datetime import timedelta  # add this import at the top with datetime
-
 def parse_reminder_command(text: str) -> Optional[Tuple[int, str]]:
     """
     Returns (seconds_from_now, reminder_text) or None.
@@ -1854,6 +2281,128 @@ def parse_reminder_command(text: str) -> Optional[Tuple[int, str]]:
 
     return None
 
+
+def parse_timer_command(text: str):
+    if not text:
+        return None
+    raw = " ".join(text.strip().split())
+    low = raw.lower()
+
+    if "set a timer" in low or low.startswith("timer"):
+        m = re.search(r"(?:set a timer for|timer)\s+([a-z0-9\- ]+?)\s*([a-zA-Z]+)\b(.*)$", raw, re.IGNORECASE)
+        if m:
+            n_raw = (m.group(1) or "").strip()
+            unit = (m.group(2) or "").lower().replace(".", "")
+            tail = (m.group(3) or "").strip()
+            name = re.sub(r"^(for|named|called)\s+", "", tail, flags=re.IGNORECASE).strip()
+            if unit == "m":
+                unit = "min"
+            if unit == "h":
+                unit = "hr"
+            n = _parse_int_loose(n_raw)
+            if n is not None and unit in _TIME_UNITS:
+                return {"action": "ADD_TIMER", "seconds": int(n) * int(_TIME_UNITS[unit]), "name": name}
+    if "pause timer" in low:
+        return {"action": "PAUSE_TIMER"}
+    if "resume timer" in low:
+        return {"action": "RESUME_TIMER"}
+    if "cancel timer" in low or "stop timer" in low:
+        return {"action": "CANCEL_TIMER"}
+    return None
+
+
+def parse_note_command(text: str):
+    if not text:
+        return None
+    raw = " ".join(text.strip().split())
+    low = raw.lower()
+    if low.startswith("take a note") or low.startswith("note:") or low.startswith("add note"):
+        note = re.sub(r"^(take a note|note:|add note)\s*:?", "", raw, flags=re.IGNORECASE).strip()
+        return note or None
+    if "list my notes" in low:
+        return "__LIST__"
+    if "search notes for" in low:
+        q = re.sub(r"^.*search notes for\s+", "", raw, flags=re.IGNORECASE).strip()
+        return {"search": q}
+    return None
+
+
+def parse_clipboard_command(text: str):
+    if not text:
+        return None
+    low = text.lower()
+    if "summarize my clipboard" in low:
+        return "summarize"
+    if "rewrite clipboard as an email" in low:
+        return "email"
+    if "turn clipboard into bullet points" in low:
+        return "bullets"
+    if "extract action items" in low:
+        return "actions"
+    return None
+
+
+def parse_memory_command(text: str):
+    if not text:
+        return None
+    raw = " ".join(text.strip().split())
+    low = raw.lower()
+    if low.startswith("remember that"):
+        value = re.sub(r"^remember that\s+", "", raw, flags=re.IGNORECASE).strip()
+        return {"action": "REMEMBER", "value": value}
+    if low.startswith("forget"):
+        value = re.sub(r"^forget\s+", "", raw, flags=re.IGNORECASE).strip()
+        return {"action": "FORGET", "value": value}
+    if low == "show memory":
+        return {"action": "SHOW"}
+    if "what do you remember about me" in low:
+        return {"action": "SHOW"}
+    if low == "export memory":
+        return {"action": "EXPORT"}
+    if low == "disable memory":
+        return {"action": "DISABLE"}
+    if low == "enable memory":
+        return {"action": "ENABLE"}
+    return None
+
+
+def parse_reminder_control(text: str):
+    if not text:
+        return None
+    raw = " ".join(text.strip().split())
+    low = raw.lower()
+    if low.startswith("snooze"):
+        m = re.search(r"snooze\s+([a-z0-9\- ]+?)\s*([a-zA-Z]+)\b", raw, re.IGNORECASE)
+        if m:
+            n_raw = (m.group(1) or "").strip()
+            unit = (m.group(2) or "").lower().replace(".", "")
+            if unit == "m":
+                unit = "min"
+            if unit == "h":
+                unit = "hr"
+            n = _parse_int_loose(n_raw)
+            if n is not None and unit in _TIME_UNITS:
+                return {"action": "SNOOZE", "seconds": int(n) * int(_TIME_UNITS[unit])}
+    if low.startswith("dismiss reminder") or low == "dismiss":
+        return {"action": "DISMISS"}
+    return None
+
+
+def parse_app_command(text: str):
+    if not text:
+        return None
+    raw = " ".join(text.strip().split())
+    low = raw.lower()
+    if low.startswith("open "):
+        app = low.replace("open ", "", 1).strip()
+        return {"action": "OPEN_APP", "app": app}
+    if low.startswith("type this"):
+        content = raw[len("type this"):].strip()
+        return {"action": "TYPE", "content": content}
+    if low in ["volume up", "volume down", "volume mute", "mute"]:
+        return {"action": "VOLUME", "command": low}
+    return None
+
 def add_reminder(memory_state, seconds_from_now: int, text: str):
     due_ts = _now_ts() + int(seconds_from_now)
     rid = f"r{int(due_ts)}_{np.random.randint(1000,9999)}"
@@ -1869,6 +2418,76 @@ def add_reminder(memory_state, seconds_from_now: int, text: str):
     # clamp
     memory_state["reminders"] = memory_state["reminders"][-REMINDERS_MAX:]
     return reminder
+
+
+def snooze_last_reminder(memory_state, seconds_from_now: int):
+    last_id = memory_state.get("last_reminder_id")
+    if not last_id:
+        return None
+    for r in memory_state.get("reminders", []) or []:
+        if r.get("id") == last_id and not r.get("done"):
+            r["due_ts"] = _now_ts() + int(seconds_from_now)
+            r["snoozed_ts"] = _now_ts()
+            return r
+    return None
+
+
+def dismiss_last_reminder(memory_state):
+    last_id = memory_state.get("last_reminder_id")
+    if not last_id:
+        return None
+    for r in memory_state.get("reminders", []) or []:
+        if r.get("id") == last_id and not r.get("done"):
+            r["done"] = True
+            r["dismissed_ts"] = _now_ts()
+            return r
+    return None
+
+
+def add_timer(memory_state, seconds_from_now: int, name: str = ""):
+    due_ts = _now_ts() + int(seconds_from_now)
+    tid = f"t{int(due_ts)}_{np.random.randint(1000,9999)}"
+    timer = {
+        "id": tid,
+        "created_ts": _now_ts(),
+        "due_ts": due_ts,
+        "name": name.strip() if name else "",
+        "paused": False,
+        "remaining_sec": int(seconds_from_now),
+    }
+    memory_state.setdefault(TIMERS_STATE_KEY, [])
+    memory_state[TIMERS_STATE_KEY].append(timer)
+    return timer
+
+
+def pause_timers(memory_state):
+    now = _now_ts()
+    updated = []
+    for t in memory_state.get(TIMERS_STATE_KEY, []) or []:
+        if not t.get("paused"):
+            remaining = int(max(0, float(t.get("due_ts", now)) - now))
+            t["remaining_sec"] = remaining
+            t["paused"] = True
+            updated.append(t)
+    return updated
+
+
+def resume_timers(memory_state):
+    now = _now_ts()
+    updated = []
+    for t in memory_state.get(TIMERS_STATE_KEY, []) or []:
+        if t.get("paused"):
+            remaining = int(t.get("remaining_sec", 0))
+            t["due_ts"] = now + remaining
+            t["paused"] = False
+            updated.append(t)
+    return updated
+
+
+def cancel_timers(memory_state):
+    count = len(memory_state.get(TIMERS_STATE_KEY, []) or [])
+    memory_state[TIMERS_STATE_KEY] = []
+    return count
 
 def pop_due_reminders(memory_state):
     """
@@ -1972,111 +2591,615 @@ def parse_when_did_i_ask(text: str) -> Optional[str]:
     return None
 
 
-# ----------------- One turn: given user text -> respond, speak, save memory -----------------
-def respond_and_store(memory_state, user_text):
-    use_screen, ambiguous = needs_screen(user_text)
+def get_clipboard_text():
+    text = ""
+    try:
+        import pyperclip
 
-        # --- Reminder command ---
-    rem = parse_reminder_command(user_text)
-    if rem:
-        seconds_from_now, rem_text = rem
-        r = add_reminder(memory_state, seconds_from_now, rem_text)
-        save_memory_state(memory_state)
-        # zeta should confirm quickly (no AI call needed)
-        mins = max(1, int(round(seconds_from_now / 60)))
-        assistant_text = f"Alright. I’ll ping you in {mins} min about: {rem_text}."
-        print("\n[AI]:", assistant_text)
-        speak(assistant_text)
-        print("-" * 50)
-        # still log it
-        append_log({
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "user": user_text,
-            "assistant": assistant_text,
-            "used_screen": False
-        })
-        memory_state["recent"].append({"role":"user","text":user_text})
-        memory_state["recent"].append({"role":"assistant","text":assistant_text})
-        memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
-        save_memory_state(memory_state)
-        return memory_state
+        text = pyperclip.paste() or ""
+    except Exception:
+        try:
+            import tkinter
 
-    # --- When did I ask? ---
-    q = parse_when_did_i_ask(user_text)
-    if q is not None:
-        query = q
-        if not query:
-            # fallback: use last user message in recent (before this one)
-            rec = memory_state.get("recent", []) or []
-            prev_users = [m["text"] for m in rec if m.get("role") == "user"]
-            query = prev_users[-1] if prev_users else ""
+            root = tkinter.Tk()
+            root.withdraw()
+            text = root.clipboard_get() or ""
+            root.destroy()
+        except Exception:
+            return ""
+    return text
 
-        res = when_did_i_ask(MEMORY_LOG_FILE, query)
-        if res.get("found"):
-            assistant_text = f"You asked {res['ts']}. You said: “{res['user']}”."
-        else:
-            assistant_text = "I can’t find that in the log. Either it never happened or the log got wiped."
-        print("\n[AI]:", assistant_text)
-        speak(assistant_text)
-        print("-" * 50)
-        append_log({
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "user": user_text,
-            "assistant": assistant_text,
-            "used_screen": False
-        })
-        memory_state["recent"].append({"role":"user","text":user_text})
-        memory_state["recent"].append({"role":"assistant","text":assistant_text})
-        memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
-        save_memory_state(memory_state)
-        return memory_state
 
-    # If it's ambiguous, ask ONE quick question instead of grabbing the screen
-    if use_screen and ambiguous and PREFER_CLARIFY_FOR_AMBIGUOUS:
-        assistant_text = ask_ai_text_only(
-            memory_state,
-            f'The user said: "{user_text}". Ask ONE short question to confirm if they want you to look at the screen, otherwise answer normally.'
-        )
-        used_screen = False
+def append_note(text: str):
+    note = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "text": text.strip(),
+    }
+    with open(NOTES_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(note, ensure_ascii=False) + "\n")
+    return note
 
+
+def read_notes(max_lines=2000):
+    if not os.path.exists(NOTES_FILE):
+        return []
+    try:
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    out = []
+    for line in lines[-max_lines:]:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def search_notes(query: str):
+    notes = read_notes()
+    q = (query or "").lower().strip()
+    if not q:
+        return []
+    return [n for n in notes if q in (n.get("text", "").lower())]
+
+
+def format_memory_for_display(memory_state):
+    parts = []
+    profile = memory_state.get("profile", {}) or {}
+    preferences = memory_state.get("preferences", {}) or {}
+    systems = memory_state.get("systems", {}) or {}
+    projects = memory_state.get("projects", []) or []
+    people = memory_state.get("people", []) or []
+
+    parts.append("PROFILE:")
+    parts.extend([f"- {k}: {v}" for k, v in profile.items()] or ["- (empty)"])
+    parts.append("PREFERENCES:")
+    parts.extend([f"- {k}: {v}" for k, v in preferences.items()] or ["- (empty)"])
+    parts.append("SYSTEMS:")
+    parts.extend([f"- {k}: {v}" for k, v in systems.items()] or ["- (empty)"])
+    parts.append("PROJECTS:")
+    if projects:
+        for p in projects:
+            if isinstance(p, dict):
+                parts.append(f"- {p.get('name','')} | {p.get('goal','')} | {p.get('status','')} | {p.get('notes','')}")
+            else:
+                parts.append(f"- {p}")
     else:
+        parts.append("- (empty)")
+    parts.append("PEOPLE:")
+    if people:
+        for person in people:
+            if isinstance(person, dict):
+                parts.append(f"- {person.get('name','')} | {person.get('relationship','')} | {person.get('notes','')}")
+            else:
+                parts.append(f"- {person}")
+    else:
+        parts.append("- (empty)")
+    return "\n".join(parts)
+
+
+def forget_memory_item(memory_state, query: str) -> int:
+    q = (query or "").lower().strip()
+    if not q:
+        return 0
+    removed = 0
+    for key in ["profile", "preferences", "systems"]:
+        data = memory_state.get(key, {}) or {}
+        for k in list(data.keys()):
+            if q in k.lower() or q in str(data.get(k, "")).lower():
+                data.pop(k, None)
+                removed += 1
+        memory_state[key] = data
+
+    for key in ["projects", "people"]:
+        items = memory_state.get(key, []) or []
+        new_items = []
+        for item in items:
+            text = json.dumps(item, ensure_ascii=False).lower() if isinstance(item, dict) else str(item).lower()
+            if q in text:
+                removed += 1
+                continue
+            new_items.append(item)
+        memory_state[key] = new_items
+
+    return removed
+
+
+def reminder_watcher_loop():
+    while not stop_event.is_set():
+        try:
+            memory_state = load_memory_state()
+            due = pop_due_reminders(memory_state)
+            if due:
+                set_assistant_state("SPEAKING")
+                for r in due:
+                    memory_state["last_reminder_id"] = r.get("id")
+                    assistant_text = f"Reminder: {r['text']}."
+                    print("\n[AI]:", assistant_text)
+                    speak(assistant_text)
+                    append_log({
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "user": "",
+                        "assistant": assistant_text,
+                        "used_screen": False,
+                        "reminder_id": r.get("id"),
+                    })
+                save_memory_state(memory_state)
+                if not conversation_active.is_set():
+                    set_assistant_state("IDLE_LISTENING")
+        except Exception:
+            log_exception("reminder watcher")
+
+        time.sleep(1.0)
+
+
+def timer_watcher_loop():
+    while not stop_event.is_set():
+        try:
+            memory_state = load_memory_state()
+            now = _now_ts()
+            timers = memory_state.get(TIMERS_STATE_KEY, []) or []
+            due = [t for t in timers if not t.get("paused") and float(t.get("due_ts", 1e18)) <= now]
+            if due:
+                set_assistant_state("SPEAKING")
+                for t in due:
+                    label = f" ({t.get('name')})" if t.get("name") else ""
+                    assistant_text = f"Timer done{label}."
+                    print("\n[AI]:", assistant_text)
+                    speak(assistant_text)
+                    append_log({
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "user": "",
+                        "assistant": assistant_text,
+                        "used_screen": False,
+                        "timer_id": t.get("id"),
+                    })
+                memory_state[TIMERS_STATE_KEY] = [t for t in timers if t not in due]
+                save_memory_state(memory_state)
+                if not conversation_active.is_set():
+                    set_assistant_state("IDLE_LISTENING")
+        except Exception:
+            log_exception("timer watcher")
+
+        time.sleep(1.0)
+
+
+# ----------------- One turn: given user text -> respond, speak, save memory -----------------
+def respond_and_store(memory_state, user_text, metrics=None):
+    try:
+        set_assistant_state("THINKING")
+        route = route_intent(user_text)
+        response_mode = route.get("response_mode", "")
+        use_screen, ambiguous = needs_screen(user_text)
+
+        if route.get("clarify_question"):
+            assistant_text = route["clarify_question"]
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        mem_cmd = parse_memory_command(user_text)
+        if mem_cmd:
+            action = mem_cmd["action"]
+            if action == "REMEMBER":
+                value = mem_cmd.get("value", "")
+                if value:
+                    memory_state.setdefault("preferences", {})
+                    memory_state["preferences"][f"note_{int(time.time())}"] = value
+                    assistant_text = "Got it. I’ll remember that."
+                else:
+                    assistant_text = "Remember what, exactly?"
+            elif action == "FORGET":
+                removed = forget_memory_item(memory_state, mem_cmd.get("value", ""))
+                assistant_text = f"Forgot {removed} item(s)." if removed else "I couldn’t find that to forget."
+            elif action == "SHOW":
+                assistant_text = format_memory_for_display(memory_state)
+            elif action == "EXPORT":
+                save_memory_state(memory_state)
+                assistant_text = "Exported memory_state.json."
+            elif action == "DISABLE":
+                memory_state["memory_enabled"] = False
+                assistant_text = "Memory disabled."
+            elif action == "ENABLE":
+                memory_state["memory_enabled"] = True
+                assistant_text = "Memory enabled."
+            else:
+                assistant_text = "Okay."
+
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        if "screen off" in user_text.lower():
+            memory_state["screen_capture_enabled"] = False
+            assistant_text = "Screen capture off."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+        if "screen on" in user_text.lower():
+            memory_state["screen_capture_enabled"] = True
+            assistant_text = "Screen capture on."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        if "pin this area" in user_text.lower():
+            rect = get_active_window_rect()
+            if rect:
+                with screen_watcher.roi_lock:
+                    screen_watcher.roi_rect = rect
+                assistant_text = "Pinned the active window."
+            else:
+                assistant_text = "I couldn't pin anything. No active window."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+        if "clear pinned area" in user_text.lower():
+            with screen_watcher.roi_lock:
+                screen_watcher.roi_rect = None
+            assistant_text = "Cleared pinned area."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        rem_ctrl = parse_reminder_control(user_text)
+        if rem_ctrl:
+            if rem_ctrl["action"] == "SNOOZE":
+                r = snooze_last_reminder(memory_state, rem_ctrl["seconds"])
+                assistant_text = "Snoozed." if r else "No reminder to snooze."
+            else:
+                r = dismiss_last_reminder(memory_state)
+                assistant_text = "Dismissed." if r else "No reminder to dismiss."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        timer_cmd = parse_timer_command(user_text)
+        if timer_cmd:
+            action = timer_cmd["action"]
+            if action == "ADD_TIMER":
+                t = add_timer(memory_state, timer_cmd["seconds"], timer_cmd.get("name", ""))
+                mins = max(1, int(round(timer_cmd["seconds"] / 60)))
+                label = f" ({t.get('name')})" if t.get("name") else ""
+                assistant_text = f"Timer set for {mins} min{label}."
+            elif action == "PAUSE_TIMER":
+                paused = pause_timers(memory_state)
+                assistant_text = f"Paused {len(paused)} timer(s)." if paused else "No timers to pause."
+            elif action == "RESUME_TIMER":
+                resumed = resume_timers(memory_state)
+                assistant_text = f"Resumed {len(resumed)} timer(s)." if resumed else "No timers to resume."
+            else:
+                count = cancel_timers(memory_state)
+                assistant_text = f"Canceled {count} timer(s)." if count else "No timers to cancel."
+
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        app_cmd = parse_app_command(user_text)
+        if app_cmd:
+            if app_cmd["action"] == "OPEN_APP":
+                app = app_cmd.get("app", "")
+                allowed = {
+                    "spotify": "spotify",
+                    "chrome": "chrome",
+                    "google chrome": "chrome",
+                    "vs code": "code",
+                    "vscode": "code",
+                }
+                cmd = allowed.get(app)
+                if cmd:
+                    try:
+                        if platform.system().lower().startswith("win"):
+                            subprocess.Popen(f'start "" "{cmd}"', shell=True)
+                        else:
+                            subprocess.Popen([cmd])
+                        assistant_text = f"Opening {app}."
+                    except Exception:
+                        log_exception("open app")
+                        assistant_text = "Couldn’t open that app."
+                else:
+                    assistant_text = "That app isn’t whitelisted."
+            elif app_cmd["action"] == "TYPE":
+                content = app_cmd.get("content", "")
+                if content:
+                    keyboard.write(content)
+                    assistant_text = "Typed."
+                else:
+                    assistant_text = "What do you want me to type?"
+            else:
+                cmd = app_cmd.get("command")
+                if cmd in ["volume up", "volume down", "volume mute", "mute"]:
+                    key = "volume up" if cmd == "volume up" else "volume down" if cmd == "volume down" else "volume mute"
+                    keyboard.send(key)
+                    assistant_text = "Done."
+                else:
+                    assistant_text = "Not sure what you want."
+
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            save_memory_state(memory_state)
+            return memory_state
+
+        note_cmd = parse_note_command(user_text)
+        if note_cmd:
+            if note_cmd == "__LIST__":
+                notes = read_notes()
+                if notes:
+                    assistant_text = "\n".join([f"{n['ts']}: {n['text']}" for n in notes[-10:]])
+                else:
+                    assistant_text = "No notes yet."
+            elif isinstance(note_cmd, dict) and "search" in note_cmd:
+                matches = search_notes(note_cmd["search"])
+                if matches:
+                    assistant_text = "\n".join([f"{n['ts']}: {n['text']}" for n in matches[-10:]])
+                else:
+                    assistant_text = "No matches."
+            else:
+                append_note(note_cmd)
+                assistant_text = "Noted."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            return memory_state
+
+        clip_cmd = parse_clipboard_command(user_text)
+        if clip_cmd:
+            clip = get_clipboard_text()
+            if not clip:
+                assistant_text = "Clipboard is empty."
+            else:
+                prompt = f"Clipboard text:\n{clip}\n\nTask: {clip_cmd}."
+                assistant_text = ollama_generate(CHAT_MODEL, prompt)
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            return memory_state
+
+        if parse_reminder_command(user_text):
+            seconds_from_now, rem_text = parse_reminder_command(user_text)
+            add_reminder(memory_state, seconds_from_now, rem_text)
+            save_memory_state(memory_state)
+            mins = max(1, int(round(seconds_from_now / 60)))
+            assistant_text = f"Alright. I’ll ping you in {mins} min about: {rem_text}."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            memory_state["recent"].append({"role": "user", "text": user_text})
+            memory_state["recent"].append({"role": "assistant", "text": assistant_text})
+            memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
+            save_memory_state(memory_state)
+            return memory_state
+
+        q = parse_when_did_i_ask(user_text)
+        if q is not None:
+            query = q
+            if not query:
+                rec = memory_state.get("recent", []) or []
+                prev_users = [m["text"] for m in rec if m.get("role") == "user"]
+                query = prev_users[-1] if prev_users else ""
+
+            res = when_did_i_ask(MEMORY_LOG_FILE, query)
+            if res.get("found"):
+                assistant_text = f"You asked {res['ts']}. You said: “{res['user']}”."
+            else:
+                assistant_text = "I can’t find that in the log. Either it never happened or the log got wiped."
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            memory_state["recent"].append({"role": "user", "text": user_text})
+            memory_state["recent"].append({"role": "assistant", "text": assistant_text})
+            memory_state["recent"] = clamp_list(memory_state["recent"], RECENT_TURNS_TO_KEEP * 2)
+            save_memory_state(memory_state)
+            return memory_state
+
+        if use_screen and not memory_state.get("screen_capture_enabled", ALLOW_SCREEN_CAPTURE):
+            assistant_text = "Screen capture is off. Want me to turn it on?"
+            print("\n[AI]:", assistant_text)
+            speak(assistant_text)
+            print("-" * 50)
+            append_log({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user_text,
+                "assistant": assistant_text,
+                "used_screen": False
+            })
+            return memory_state
+
         if use_screen:
             print("[4] Thinking (screen)...")
-            assistant_text = ask_ai_with_screen(memory_state, user_text)
+            speak("Got it — looking at the screen.")
+            prompt, images = build_screen_prompt(memory_state, user_text, response_mode=response_mode)
+            if metrics is not None:
+                metrics["llm_start_ts"] = time.time()
+            try:
+                assistant_text = stream_reply_with_tts(VISION_MODEL, prompt, images=images)
+            except Exception:
+                log_exception("vision stream")
+                try:
+                    prompt, images = build_screen_prompt(memory_state, user_text, response_mode=response_mode, include_ocr=False)
+                    assistant_text = stream_reply_with_tts(VISION_MODEL, prompt, images=images)
+                except Exception:
+                    log_exception("vision retry no ocr")
+                    prompt, images = build_screen_prompt(memory_state, user_text, response_mode=response_mode, include_roi=False, include_ocr=False)
+                    assistant_text = stream_reply_with_tts(VISION_MODEL, prompt, images=images)
+            if metrics is not None:
+                metrics["llm_end_ts"] = time.time()
+                if metrics.get("llm_start_ts"):
+                    metrics["llm_sec"] = metrics["llm_end_ts"] - metrics["llm_start_ts"]
             used_screen = True
         else:
             print("[4] Thinking (chat)...")
-            assistant_text = ask_ai_text_only(memory_state, user_text)
+            prompt = build_prompt(memory_state, user_text, response_mode=response_mode)
+            if metrics is not None:
+                metrics["llm_start_ts"] = time.time()
+            try:
+                assistant_text = stream_reply_with_tts(CHAT_MODEL, prompt)
+            except Exception:
+                log_exception("chat stream")
+                assistant_text = ollama_generate(FALLBACK_CHAT_MODEL, prompt)
+            if metrics is not None:
+                metrics["llm_end_ts"] = time.time()
+                if metrics.get("llm_start_ts"):
+                    metrics["llm_sec"] = metrics["llm_end_ts"] - metrics["llm_start_ts"]
             used_screen = False
 
-    # Optional: add a tiny “initiative” line sometimes (Neuro-style)
-    assistant_text = maybe_add_initiative(memory_state, assistant_text)
+        due_now = pop_due_reminders(memory_state)
+        if due_now:
+            reminder_lines = [f"Reminder: {r['text']}." for r in due_now]
+            assistant_text = "\n".join(reminder_lines + [assistant_text])
 
-    # Output safety guard
+        assistant_text = maybe_add_initiative(memory_state, assistant_text)
 
-    print("\n[AI]:", assistant_text)
-    speak(assistant_text)
-    print("-" * 50)
+        print("\n[AI]:", assistant_text)
+        if not tts_pending_or_busy():
+            speak(assistant_text)
+        print("-" * 50)
 
-    event = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "user": user_text,
-        "assistant": assistant_text,
-        "used_screen": bool(used_screen)
-    }
-    append_log(event)
+        event = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "user": user_text,
+            "assistant": assistant_text,
+            "used_screen": bool(used_screen)
+        }
+        append_log(event)
 
-    memory_state = update_memory(memory_state, user_text, assistant_text)
-    memory_state = update_character_state(memory_state, user_text, assistant_text)
+        memory_state = update_memory(memory_state, user_text, assistant_text)
+        memory_state = update_character_state(memory_state, user_text, assistant_text)
 
-    save_memory_state(memory_state)
-    return memory_state
+        save_memory_state(memory_state)
+        if not ENABLE_TTS and metrics is not None:
+            metrics["tts_start_ts"] = metrics.get("tts_start_ts") or time.time()
+            metrics["tts_end_ts"] = time.time()
+            if metrics.get("record_start_ts") and metrics.get("tts_end_ts"):
+                metrics["total_sec"] = metrics["tts_end_ts"] - metrics["record_start_ts"]
+            if metrics.get("tts_start_ts") and metrics.get("tts_end_ts"):
+                metrics["tts_sec"] = metrics["tts_end_ts"] - metrics["tts_start_ts"]
+            log_turn_metrics(metrics)
+        return memory_state
+    except Exception:
+        log_exception("respond_and_store")
+        assistant_text = "Something broke. I’m still here—try that again."
+        print("\n[AI]:", assistant_text)
+        speak(assistant_text)
+        return memory_state
 
 
 # ----------------- Always-listening wake loop -----------------
 wake_event = threading.Event()
 stop_event = threading.Event()
 conversation_active = threading.Event()
+
+assistant_state = "IDLE_LISTENING"
+assistant_state_lock = threading.Lock()
+
+
+def set_assistant_state(state: str):
+    global assistant_state
+    with assistant_state_lock:
+        assistant_state = state
+
+
+def get_assistant_state() -> str:
+    with assistant_state_lock:
+        return assistant_state
 
 def wake_listener_loop():
     if not os.path.isdir(VOSK_MODEL_PATH):
@@ -2156,18 +3279,29 @@ def beep():
 # ----------------- Main behavior -----------------
 def main_loop():
     memory_state = load_memory_state()
+    miss_count = 0
 
     while not stop_event.is_set():
         # Always listening for a new command
-        audio = record_until_silence()
+        set_assistant_state("RECORDING_COMMAND")
+        metrics = {"turn_id": f"turn_{int(time.time()*1000)}"}
+        audio = record_until_silence(metrics=metrics)
         if audio is None:
+            set_assistant_state("IDLE_LISTENING")
             continue
 
         print("[2] Transcribing...")
+        metrics["asr_start_ts"] = time.time()
         user_text = transcribe_best_of_two(audio)
+        metrics["asr_end_ts"] = time.time()
         if looks_bad_transcript(user_text):
+            miss_count += 1
+            if miss_count <= 1:
+                speak("Didn’t catch that — say it again.")
             # If it's garbage, ignore it and keep listening
+            set_assistant_state("IDLE_LISTENING")
             continue
+        miss_count = 0
 
         print(f"[You]: {user_text}")
 
@@ -2178,12 +3312,18 @@ def main_loop():
             speak("Done. Fresh slate.")
             print("-" * 50)
             memory_state = load_memory_state()
+            set_assistant_state("IDLE_LISTENING")
             continue
 
-        memory_state = respond_and_store(memory_state, user_text)
+        conversation_active.set()
+        set_active_metrics(metrics)
+        memory_state = respond_and_store(memory_state, user_text, metrics=metrics)
+        if metrics.get("asr_start_ts") and metrics.get("asr_end_ts"):
+            metrics["asr_sec"] = metrics["asr_end_ts"] - metrics["asr_start_ts"]
 
         # Keep your existing barge-in loop (it already avoids listening while TTS is active)
         while not stop_event.is_set():
+            set_assistant_state("FOLLOWUP_WINDOW")
             if tts_pending_or_busy():
                 t0 = time.time()
                 while (time.time() - t0) < 0.6 and tts_queue.unfinished_tasks > 0 and not tts_busy.is_set():
@@ -2216,12 +3356,16 @@ def main_loop():
                 continue
 
             print(f"[You]: {follow_text}")
-            memory_state = respond_and_store(memory_state, follow_text)
+            set_active_metrics(metrics)
+            memory_state = respond_and_store(memory_state, follow_text, metrics=metrics)
 
-            conversation_active.clear()
+        conversation_active.clear()
+        set_assistant_state("IDLE_LISTENING")
 
 # ----------------- Start -----------------
 start_tts()
+threading.Thread(target=reminder_watcher_loop, daemon=True).start()
+threading.Thread(target=timer_watcher_loop, daemon=True).start()
 
 # ESC to quit
 keyboard.on_press_key("esc", lambda e: on_esc())
